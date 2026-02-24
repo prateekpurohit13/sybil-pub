@@ -1,0 +1,40 @@
+#!/bin/sh
+
+set -e
+
+README="README.md"
+MARKER_START="<!-- tokei-start -->"
+MARKER_END="<!-- tokei-end -->"
+
+if ! command -v tokei >/dev/null 2>&1; then
+    echo "pre-commit-tokei: tokei not found, skipping stats update"
+    exit 0
+fi
+
+tokei_output=$(tokei)
+
+stats_block="${MARKER_START}
+## Stats
+
+\`\`\`
+${tokei_output}
+\`\`\`
+${MARKER_END}"
+
+if grep -q "$MARKER_START" "$README"; then
+    # Update existing block — remove everything between markers (inclusive) and replace
+    head_content=$(sed "/${MARKER_START}/,\$d" "$README")
+    tail_content=$(sed "1,/${MARKER_END}/d" "$README")
+    {
+        printf '%s\n\n' "$head_content"
+        printf '%s\n' "$stats_block"
+        if [ -n "$tail_content" ]; then
+            printf '%s\n' "$tail_content"
+        fi
+    } > "$README"
+else
+    # Append to end
+    printf '\n%s\n' "$stats_block" >> "$README"
+fi
+
+git add "$README"

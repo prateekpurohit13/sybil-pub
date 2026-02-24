@@ -8,3 +8,6 @@ go generate ./internal/ebpf/...
 # Stage the generated files if they changed
 git add internal/ebpf/bpf_bpfeb.go internal/ebpf/bpf_bpfeb.o \
         internal/ebpf/bpf_bpfel.go internal/ebpf/bpf_bpfel.o
+
+echo "pre-commit: updating tokei stats in README..."
+.githooks/pre-commit-tokei

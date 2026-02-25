@@ -6,9 +6,6 @@ generate:
 build: generate
 	go build -o bin/analyzer ./cmd/analyzer
 
-run: build
-	sudo ./bin/analyzer -iface $(IFACE)
-
 test:
 	go test ./...
 

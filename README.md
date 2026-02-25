@@ -1,3 +1,23 @@
+## Usage
+
+Generate eBPF code:
+
+```
+make generate
+```
+
+Build the analyzer binary:
+
+```
+make build
+```
+
+Run the analyzer (requires root privileges):
+
+```
+sudo ./bin/analyzer -iface lo
+```
+
 ## References
 
 - https://blog.cloudflare.com/ja4-signals/
@@ -15,10 +35,10 @@
  C                         1          114           78           13           23
  Dockerfile                1           26           18            5            3
  Go                        9          615          438           89           88
- Makefile                  1           16           11            0            5
- Markdown                  1           24            0           21            3
+ Makefile                  1           13            9            0            4
+ Markdown                  1           46            0           34           12
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    14          795          545          128          122
+ Total                    14          814          543          141          130
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

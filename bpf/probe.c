@@ -90,15 +90,15 @@ int xdp_tls_parser(struct xdp_md *ctx) {
   e->src_port = bpf_ntohs(tcp->source);
   e->dst_port = bpf_ntohs(tcp->dest);
 
-  // Copy only the TLS payload (from TLS record header onward)
-  __u32 tls_len = (__u32)(data_end - (void *)payload);
+  // Copy only the TLS payload (from TLS record header onward).
+  long tls_len = data_end - (void *)payload;
+  if (tls_len < 0)
+    tls_len = 0;
   if (tls_len > MAX_TLS_SIZE)
     tls_len = MAX_TLS_SIZE;
-  e->tls_len = tls_len;
+  e->tls_len = (__u32)tls_len;
 
-  for (__u32 i = 0; i < MAX_TLS_SIZE; i++) {
-    if (i >= tls_len)
-      break;
+  for (long i = 0; i < MAX_TLS_SIZE && i < tls_len; i++) {
     if ((void *)(payload + i + 1) > data_end)
       break;
     e->tls_data[i] = payload[i];

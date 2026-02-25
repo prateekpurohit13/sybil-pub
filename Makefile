@@ -1,10 +1,13 @@
-.PHONY: generate build test setup
+.PHONY: generate build test setup run
 
 generate:
 	go generate ./internal/ebpf/...
 
 build: generate
-	go build ./...
+	go build -o bin/analyzer ./cmd/analyzer
+
+run: build
+	sudo ./bin/analyzer -iface $(IFACE)
 
 test:
 	go test ./...

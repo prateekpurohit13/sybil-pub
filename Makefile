@@ -21,4 +21,3 @@ setup:
 clean:
 	rm -rf bin
 	rm -f ebpf/xdptcp_bpfel.go ebpf/xdptcp_bpfel.o ebpf/xdptcp_bpfeb.go ebpf/xdptcp_bpfeb.o
-	rm -f traffic.log

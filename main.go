@@ -24,20 +24,16 @@ import (
 
 var (
         ifaceName = flag.String("iface", "lo", "Interface to attach XDP program to")
-        logFile   = flag.String("log", "traffic.log", "Log file for non-TLS traffic")
 )
 
-type tlsStreamFactory struct {
-        logger *log.Logger
-}
+type tlsStreamFactory struct{}
 
 func (f *tlsStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
-        return &tlsStream{net: net, transport: transport, factory: f}
+        return &tlsStream{net: net, transport: transport}
 }
 
 type tlsStream struct {
         net, transport gopacket.Flow
-        factory        *tlsStreamFactory
         started        bool
 }
 
@@ -50,7 +46,6 @@ func (s *tlsStream) Reassembled(reassemblies []tcpassembly.Reassembly) {
 
                 if !s.started {
                         // Find TLS Client/Server Hello in the first chunk
-                        found := false
                         for i := 0; i <= len(data)-6 && i < 64; i++ {
                                 if data[i] == 0x16 && data[i+1] == 0x03 {
                                         handshakeType := data[i+5]
@@ -65,21 +60,13 @@ func (s *tlsStream) Reassembled(reassemblies []tcpassembly.Reassembly) {
                                                 fmt.Printf("\n--- Detected TLS %s (%s:%s -> %s:%s) ---\n",
                                                         msg, s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst())
                                                 fmt.Println(hex.Dump(data[i:]))
-                                                found = true
                                                 s.started = true
                                                 break
                                         }
                                 }
                         }
-
-                        if !found {
-                                s.started = true
-                                s.factory.logger.Printf("New Stream (No TLS header): %s:%s -> %s:%s\nData:\n%s",
-                                        s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), hex.Dump(data))
-                        }
-                } else {
-                        s.factory.logger.Printf("Data (%s:%s -> %s:%s):\n%s",
-                                s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), hex.Dump(data))
+                        // Mark as started even if not TLS to skip further checks for this stream
+                        s.started = true
                 }
         }
 }
@@ -124,14 +111,7 @@ func main() {
         }
         defer rd.Close()
 
-        // 5. Setup log file for non-TLS traffic
-        f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-        if err != nil {
-                log.Fatalf("opening log file: %v", err)
-        }
-        defer f.Close()
-
-        streamFactory := &tlsStreamFactory{logger: log.New(f, "", log.LstdFlags)}
+        streamFactory := &tlsStreamFactory{}
         pool := tcpassembly.NewStreamPool(streamFactory)
         assembler := tcpassembly.NewAssembler(pool)
 

@@ -1,4 +1,4 @@
-.PHONY: build test setup generate run clean
+.PHONY: build test setup generate run run-pcap clean
 
 IFACE ?= wlan0
 
@@ -11,6 +11,9 @@ build: generate
 
 run: build
 	sudo ./bin/sybil -iface $(IFACE)
+
+run-pcap: build
+	sudo ./bin/sybil -backend pcap -iface $(IFACE)
 
 test:
 	go test ./...

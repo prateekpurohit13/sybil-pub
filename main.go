@@ -22,6 +22,7 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/tcpassembly"
 	"github.com/sophic00/sybil/ebpf"
+	"github.com/sophic00/sybil/internal/fingerprint"
 	"github.com/sophic00/sybil/internal/parser"
 	"github.com/sophic00/sybil/internal/tlshello"
 )
@@ -90,6 +91,16 @@ func (s *tlsStream) Reassembled(reassemblies []tcpassembly.Reassembly) {
 				fmt.Printf("  cipher_count        : %d\n", fields.CipherCount)
 				fmt.Printf("  extension_count     : %d\n", fields.ExtensionCount)
 				fmt.Printf("  alpn_first          : %s\n", fields.FirstALPN)
+
+				ja4, err := fingerprint.BuildJA4(fields)
+				if err != nil {
+					fmt.Printf("JA4 build error: %v\n", err)
+				} else {
+					fmt.Printf("  ja4_a               : %s\n", ja4.A)
+					fmt.Printf("  ja4_b               : %s\n", ja4.B)
+					fmt.Printf("  ja4_c               : %s\n", ja4.C)
+					fmt.Printf("JA4: %s\n", ja4.Fingerprint)
+				}
 			}
 		}
 

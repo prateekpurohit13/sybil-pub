@@ -78,18 +78,23 @@ def start_https_server(bind: str, port: int, cert_path: str, key_path: str) -> T
     return httpd
 
 
-def request_once(host: str, port: int, sni: str, timeout: float, path: str) -> bool:
+def make_client_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    return context
 
-    request = (
+
+def build_http_request(path: str, sni: str) -> bytes:
+    return (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {sni}\r\n"
         "User-Agent: sybil-demo-client/1.0\r\n"
         "Connection: close\r\n\r\n"
     ).encode("ascii")
 
+
+def request_once(context: ssl.SSLContext, request: bytes, host: str, port: int, sni: str, timeout: float) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             with context.wrap_socket(sock, server_hostname=sni) as tls_sock:
@@ -108,17 +113,19 @@ def run_phase(phase: Phase, host: str, port: int, sni: str, timeout: float, path
 
     def worker() -> None:
         nonlocal ok, fail
+        context = make_client_context()
+        request = build_http_request(path, sni)
         pace = 1.0 / max(phase.requests_per_worker_per_second, 1)
         while time.time() < stop_at:
             started = time.time()
-            success = request_once(host, port, sni, timeout, path)
+            success = request_once(context, request, host, port, sni, timeout)
             with lock:
                 if success:
                     ok += 1
                 else:
                     fail += 1
 
-            jitter = random.uniform(-0.004, 0.004)
+            jitter = random.uniform(-0.002, 0.002)
             sleep_for = max(0.0, pace + jitter - (time.time() - started))
             time.sleep(sleep_for)
 
@@ -138,17 +145,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--path", default="/", help="HTTP path to request (default: /)")
     p.add_argument("--timeout", type=float, default=2.0, help="Socket timeout seconds")
 
-    p.add_argument("--warmup-seconds", type=int, default=60)
+    p.add_argument("--warmup-seconds", type=int, default=20)
     p.add_argument("--warmup-rate", type=int, default=2)
     p.add_argument("--warmup-concurrency", type=int, default=4)
 
-    p.add_argument("--mid-seconds", type=int, default=60)
+    p.add_argument("--mid-seconds", type=int, default=20)
     p.add_argument("--mid-rate", type=int, default=2)
     p.add_argument("--mid-concurrency", type=int, default=4)
 
-    p.add_argument("--spike-seconds", type=int, default=60)
-    p.add_argument("--spike-rate", type=int, default=40)
-    p.add_argument("--spike-concurrency", type=int, default=24)
+    p.add_argument("--spike-seconds", type=int, default=35)
+    p.add_argument("--spike-rate", type=int, default=140)
+    p.add_argument("--spike-concurrency", type=int, default=64)
     return p.parse_args()
 
 

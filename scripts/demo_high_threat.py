@@ -20,7 +20,6 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 from urllib.parse import urlparse
 
 
@@ -50,11 +49,15 @@ def parse_target(target: str, default_port: int) -> tuple[str, int, str]:
     return target, default_port, target
 
 
-def tls_handshake(host: str, port: int, sni: str, timeout: float) -> bool:
+def make_client_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
     # For scoring demos we only need ClientHello generation, not cert validation.
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def tls_handshake(context: ssl.SSLContext, host: str, port: int, sni: str, timeout: float) -> bool:
 
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -73,9 +76,10 @@ def run_phase(phase: Phase, host: str, port: int, sni: str, timeout: float) -> t
 
     def worker() -> None:
         nonlocal ok, fail
+        context = make_client_context()
         while time.time() < stop_at:
             start = time.time()
-            success = tls_handshake(host, port, sni, timeout)
+            success = tls_handshake(context, host, port, sni, timeout)
             with lock:
                 if success:
                     ok += 1
@@ -113,17 +117,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Minute-bucket friendly pattern: 2 calm minutes + 1 spike minute.
-    parser.add_argument("--warmup-seconds", type=int, default=60)
+    parser.add_argument("--warmup-seconds", type=int, default=20)
     parser.add_argument("--warmup-rate", type=int, default=2)
     parser.add_argument("--warmup-concurrency", type=int, default=4)
 
-    parser.add_argument("--mid-seconds", type=int, default=60)
+    parser.add_argument("--mid-seconds", type=int, default=20)
     parser.add_argument("--mid-rate", type=int, default=2)
     parser.add_argument("--mid-concurrency", type=int, default=4)
 
-    parser.add_argument("--spike-seconds", type=int, default=60)
-    parser.add_argument("--spike-rate", type=int, default=40)
-    parser.add_argument("--spike-concurrency", type=int, default=24)
+    parser.add_argument("--spike-seconds", type=int, default=30)
+    parser.add_argument("--spike-rate", type=int, default=160)
+    parser.add_argument("--spike-concurrency", type=int, default=72)
 
     return parser.parse_args()
 

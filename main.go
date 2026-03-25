@@ -174,6 +174,18 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 
 	riskCfg := risk.DefaultConfig()
 	riskCfg.UseHostFallback = cfg.UseHostFallback
+	if cfg.DelayThreshold >= 0 {
+		riskCfg.DelayThreshold = cfg.DelayThreshold
+	}
+	if cfg.RateLimitThresh >= 0 {
+		riskCfg.RateLimitThreshold = cfg.RateLimitThresh
+	}
+	if cfg.ChallengeThresh >= 0 {
+		riskCfg.ChallengeThreshold = cfg.ChallengeThresh
+	}
+	if cfg.BlockThresh >= 0 {
+		riskCfg.BlockThreshold = cfg.BlockThresh
+	}
 
 	var store risk.StatsStore = risk.NewRedisStore(rdb, cfg.KeyPrefix)
 	if registry != nil {

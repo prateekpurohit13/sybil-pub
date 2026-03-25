@@ -41,6 +41,10 @@ type Risk struct {
 	JA4DBAuthToken   string
 	JA4CacheTTL      time.Duration
 	UseHostFallback  bool
+	DelayThreshold   int
+	RateLimitThresh  int
+	ChallengeThresh  int
+	BlockThresh      int
 }
 
 type Observability struct {
@@ -67,6 +71,10 @@ func Parse() Config {
 	flag.StringVar(&cfg.Risk.JA4DBAuthToken, "ja4-db-auth-token", os.Getenv("AUTH_TOKEN"), "Optional auth token for the JA4 libSQL/Turso database")
 	flag.DurationVar(&cfg.Risk.JA4CacheTTL, "ja4-cache-ttl", 30*time.Minute, "Redis TTL for cached JA4 enrichment lookups")
 	flag.BoolVar(&cfg.Risk.UseHostFallback, "risk-use-host-fallback", true, "Use SNI host as a weaker diversity signal when the real endpoint path is unavailable")
+	flag.IntVar(&cfg.Risk.DelayThreshold, "risk-delay-threshold", -1, "Optional override for delay threshold (default scorer config when negative)")
+	flag.IntVar(&cfg.Risk.RateLimitThresh, "risk-rate-limit-threshold", -1, "Optional override for rate-limit threshold (default scorer config when negative)")
+	flag.IntVar(&cfg.Risk.ChallengeThresh, "risk-challenge-threshold", -1, "Optional override for challenge threshold (default scorer config when negative)")
+	flag.IntVar(&cfg.Risk.BlockThresh, "risk-block-threshold", -1, "Optional override for block threshold (default scorer config when negative)")
 	flag.StringVar(&cfg.Observability.HTTPAddr, "http-addr", ":9090", "HTTP listen address for /metrics and /healthz; empty disables the server")
 
 	flag.Parse()

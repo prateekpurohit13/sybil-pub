@@ -1,0 +1,3 @@
+[submodule "sybil_fe"]
+	path = sybil_fe
+	url = https://github.com/prateekpurohit13/sybil_fe.git

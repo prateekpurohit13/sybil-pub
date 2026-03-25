@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	redis "github.com/redis/go-redis/v9"
 	"github.com/sophic00/sybil/internal/capture"
 	"github.com/sophic00/sybil/internal/config"
+	"github.com/sophic00/sybil/internal/db"
 	"github.com/sophic00/sybil/internal/parser"
 	"github.com/sophic00/sybil/internal/risk"
 	"github.com/sophic00/sybil/internal/stream"
@@ -108,15 +108,13 @@ func newThreatScorer(ctx context.Context, cfg config.Risk) (*risk.Scorer, func()
 		return nil, func() {}, nil
 	}
 
-	rdb := redis.NewClient(&redis.Options{
+	rdb, err := db.OpenRedis(ctx, db.RedisConfig{
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
 	})
-
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		_ = rdb.Close()
-		return nil, func() {}, fmt.Errorf("redis ping failed: %w", err)
+	if err != nil {
+		return nil, func() {}, err
 	}
 
 	riskCfg := risk.DefaultConfig()

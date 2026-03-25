@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	_ "github.com/mattn/go-sqlite3" // SQLite driver
+	"github.com/sophic00/sybil/internal/db"
 )
 
 // Fingerprint struct to represent the fingerprint data
@@ -30,17 +30,17 @@ type Fingerprint struct {
 }
 
 func GetFingerprint(input string) (string, error) {
-	dbURL := os.Getenv("DB_URL")
 	authToken := os.Getenv("AUTH_TOKEN")
 
-	if dbURL == "" || authToken == "" {
-		return "", fmt.Errorf("missing database URL or authentication token in environment variables")
+	if authToken == "" {
+		return "", fmt.Errorf("missing authentication token in environment variables")
 	}
-	db, err := sql.Open("sqlite3", dbURL)
+
+	conn, err := db.OpenSQLiteFromEnv()
 	if err != nil {
 		return "", fmt.Errorf("failed to connect to database: %v", err)
 	}
-	defer db.Close()
+	defer conn.Close()
 
 	if authToken != "expected_token_value" {
 		return "", fmt.Errorf("invalid authentication token")
@@ -51,19 +51,44 @@ func GetFingerprint(input string) (string, error) {
 		ja4t_fingerprint, ja4ts_fingerprint, ja4tscan_fingerprint
 		FROM fingerprints WHERE ja4_fingerprint = ?`
 
-	row := db.QueryRow(query, input)
+	row := conn.QueryRow(query, input)
 
-	var fingerprint Fingerprint
-	var verified int
+	var (
+		fingerprint          Fingerprint
+		application          sql.NullString
+		library              sql.NullString
+		device               sql.NullString
+		osName               sql.NullString
+		userAgent            sql.NullString
+		certificateAuthority sql.NullString
+		verified             int
+		notes                sql.NullString
+		ja4Fingerprint       sql.NullString
+		ja4FingerprintString sql.NullString
+		ja4sFingerprint      sql.NullString
+		ja4hFingerprint      sql.NullString
+		ja4xFingerprint      sql.NullString
+		ja4tFingerprint      sql.NullString
+		ja4tsFingerprint     sql.NullString
+		ja4tscanFingerprint  sql.NullString
+	)
 	err = row.Scan(
-		&fingerprint.Application,
-		&fingerprint.Library,
-		&fingerprint.Device,
-		&fingerprint.OS,
-		&fingerprint.UserAgentString,
-		&fingerprint.CertificateAuthority,
+		&application,
+		&library,
+		&device,
+		&osName,
+		&userAgent,
+		&certificateAuthority,
 		&verified,
-		&fingerprint.Notes,
+		&notes,
+		&ja4Fingerprint,
+		&ja4FingerprintString,
+		&ja4sFingerprint,
+		&ja4hFingerprint,
+		&ja4xFingerprint,
+		&ja4tFingerprint,
+		&ja4tsFingerprint,
+		&ja4tscanFingerprint,
 	)
 
 	if err == sql.ErrNoRows {
@@ -72,7 +97,22 @@ func GetFingerprint(input string) (string, error) {
 		return "", fmt.Errorf("failed to query database: %v", err)
 	}
 
+	fingerprint.Application = nullStringPtr(application)
+	fingerprint.Library = nullStringPtr(library)
+	fingerprint.Device = nullStringPtr(device)
+	fingerprint.OS = nullStringPtr(osName)
+	fingerprint.UserAgentString = nullStringValue(userAgent)
+	fingerprint.CertificateAuthority = nullStringPtr(certificateAuthority)
 	fingerprint.Verified = verified == 1
+	fingerprint.Notes = nullStringPtr(notes)
+	fingerprint.JA4Fingerprint = nullStringValue(ja4Fingerprint)
+	fingerprint.JA4FingerprintString = nullStringValue(ja4FingerprintString)
+	fingerprint.JA4SFingerprint = nullStringPtr(ja4sFingerprint)
+	fingerprint.JA4HFingerprint = nullStringValue(ja4hFingerprint)
+	fingerprint.JA4XFingerprint = nullStringPtr(ja4xFingerprint)
+	fingerprint.JA4TFingerprint = nullStringPtr(ja4tFingerprint)
+	fingerprint.JA4TSFingerprint = nullStringPtr(ja4tsFingerprint)
+	fingerprint.JA4TScanFingerprint = nullStringPtr(ja4tscanFingerprint)
 
 	jsonData, err := json.Marshal(fingerprint)
 	if err != nil {
@@ -81,4 +121,20 @@ func GetFingerprint(input string) (string, error) {
 
 	return string(jsonData), nil
 
+}
+
+func nullStringPtr(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+
+	copy := value.String
+	return &copy
+}
+
+func nullStringValue(value sql.NullString) string {
+	if !value.Valid {
+		return ""
+	}
+	return value.String
 }

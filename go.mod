@@ -6,6 +6,7 @@ require (
 	github.com/cilium/ebpf v0.21.0
 	github.com/google/gopacket v1.1.19
 	github.com/redis/go-redis/v9 v9.17.0
+	github.com/mattn/go-sqlite3 v1.14.37
 	golang.org/x/crypto v0.49.0
 )
 

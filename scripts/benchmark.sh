@@ -11,13 +11,16 @@ set -euo pipefail
 # Requires: sudo, curl, jq (optional, for pretty JSON), /proc filesystem.
 # ---------------------------------------------------------------------------
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(dirname "$SCRIPT_DIR")
+
 IFACE="${IFACE:-lo}"
 PORT="${PORT:-4433}"
 HTTP_ADDR="${HTTP_ADDR:-:9099}"
 DURATION="${DURATION:-15}"
 TRAFFIC_CONCURRENCY="${TRAFFIC_CONCURRENCY:-6}"
 TRAFFIC_REQUESTS="${TRAFFIC_REQUESTS:-120}"
-BINARY="./bin/sybil"
+BINARY="${BINARY:-$REPO_ROOT/bin/sybil}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -29,6 +32,18 @@ log()  { printf "${CYAN}[bench]${RESET} %s\n" "$*"; }
 logb() { printf "${BOLD}%s${RESET}\n" "$*"; }
 die()  { printf "${RED}error:${RESET} %s\n" "$*" >&2; exit 1; }
 
+# http_listen_addr turns -http-addr into an address curl can reach locally.
+# ":9099" binds all interfaces; curl needs a concrete loopback host, so
+# prepend 127.0.0.1. An explicit "host:port" is used as-is.
+http_listen_addr() {
+    local addr="$1"
+    if [[ "$addr" == :* ]]; then
+        printf '127.0.0.1%s' "$addr"
+    else
+        printf '%s' "$addr"
+    fi
+}
+
 cleanup() {
     if [[ -n "${SYBIL_PID:-}" ]] && kill -0 "$SYBIL_PID" 2>/dev/null; then
         sudo kill "$SYBIL_PID" 2>/dev/null || true
@@ -38,7 +53,7 @@ cleanup() {
         kill "$TLS_SERVER_PID" 2>/dev/null || true
         wait "$TLS_SERVER_PID" 2>/dev/null || true
     fi
-    rm -f "$METRICS_FILE" "$TLS_SERVER_SCRIPT"
+    rm -f "${METRICS_FILE:-}" "${TLS_SERVER_SCRIPT:-}"
 }
 trap cleanup EXIT
 
@@ -49,7 +64,7 @@ TLS_SERVER_SCRIPT=$(mktemp --suffix=.py)
 
 command -v curl  >/dev/null || die "curl is required"
 command -v python3 >/dev/null || die "python3 is required"
-[[ -f "$BINARY" ]] || { log "Building sybil..."; make -C "$(dirname "$0")/.." build; }
+[[ -f "$BINARY" ]] || { log "Building sybil..."; make -C "$REPO_ROOT" build; }
 [[ -f "$BINARY" ]] || die "binary not found at $BINARY"
 
 # ---- tiny TLS server on loopback -----------------------------------------
@@ -169,8 +184,8 @@ sample_proc_stats() {
 
 run_backend() {
     local backend="$1"
-    local addr="${HTTP_ADDR#:}"
-    local listen="127.0.0.1:${addr}"
+    local listen
+    listen=$(http_listen_addr "$HTTP_ADDR")
 
     logb "=== Backend: $backend ==="
 
@@ -235,14 +250,14 @@ run_backend() {
 
     sleep 1
 
-    eval "R_${backend}_packets=${packets:-0}"
-    eval "R_${backend}_hellos=${hellos:-0}"
-    eval "R_${backend}_errors=${errors:-0}"
-    eval "R_${backend}_pps=${pps}"
-    eval "R_${backend}_avg_event_us=${avg_event_us}"
-    eval "R_${backend}_wall_ms=${wall_ms}"
-    eval "R_${backend}_rss_kb=${peak_rss_kb}"
-    eval "R_${backend}_cpu_ticks=${cpu_delta}"
+    printf -v "R_${backend}_packets" '%s' "${packets:-0}"
+    printf -v "R_${backend}_hellos" '%s' "${hellos:-0}"
+    printf -v "R_${backend}_errors" '%s' "${errors:-0}"
+    printf -v "R_${backend}_pps" '%s' "${pps}"
+    printf -v "R_${backend}_avg_event_us" '%s' "${avg_event_us}"
+    printf -v "R_${backend}_wall_ms" '%s' "${wall_ms}"
+    printf -v "R_${backend}_rss_kb" '%s' "${peak_rss_kb}"
+    printf -v "R_${backend}_cpu_ticks" '%s' "${cpu_delta}"
 }
 
 # ---- main -----------------------------------------------------------------

@@ -3,7 +3,10 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +27,16 @@ const (
 	DefaultHTTPReadTimeout       = 10 * time.Second
 	DefaultHTTPWriteTimeout      = 10 * time.Second
 	DefaultHTTPIdleTimeout       = 60 * time.Second
+
+	// Default risk action thresholds. They mirror risk.DefaultConfig in
+	// internal/risk/scorer.go; validateThresholds needs them to check the
+	// ordering even when only some -risk-*-threshold overrides are set. Keep
+	// the two in sync (config deliberately does not import risk so that flag
+	// validation stays dependency-free).
+	defaultDelayThreshold     = 70
+	defaultRateLimitThreshold = 80
+	defaultChallengeThreshold = 90
+	defaultBlockThreshold     = 95
 )
 
 type Config struct {
@@ -101,7 +114,7 @@ func Parse() Config {
 	var cfg Config
 
 	flag.StringVar(&cfg.Capture.Backend, "backend", BackendPCAP, "Capture backend: pcap or ebpf")
-	flag.StringVar(&cfg.Capture.Interface, "iface", "lo", "Interface to attach XDP program to")
+	flag.StringVar(&cfg.Capture.Interface, "iface", "lo", "Interface to capture on (pcap) or to attach the XDP program to (ebpf)")
 	flag.UintVar(&cfg.Capture.MatchPort, "port", 0, "Only inspect TCP traffic where either source or destination port matches")
 
 	flag.StringVar(&cfg.Output.HelloOutPath, "hello-out", "", "Write the first detected TLS hello record bytes to this file")
@@ -164,6 +177,12 @@ func parseCORSOrigins(raw string) ([]string, error) {
 		if origin == "*" {
 			return nil, fmt.Errorf("wildcard CORS origin is not supported; list explicit origins instead")
 		}
+		// Accept a trailing slash but store the origin exactly as a browser
+		// sends it, so the allowlist comparison in the API middleware matches.
+		origin = strings.TrimSuffix(origin, "/")
+		if err := validateCORSOrigin(origin); err != nil {
+			return nil, err
+		}
 		if _, ok := seen[origin]; ok {
 			continue
 		}
@@ -173,11 +192,169 @@ func parseCORSOrigins(raw string) ([]string, error) {
 	return origins, nil
 }
 
+// validateCORSOrigin requires an absolute http(s) origin without a path,
+// query, fragment or userinfo. A malformed entry would otherwise fail open
+// (never match) or produce an invalid header value.
+func validateCORSOrigin(origin string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return fmt.Errorf("invalid CORS origin %q: %w", origin, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("invalid CORS origin %q: scheme must be http or https", origin)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("invalid CORS origin %q: missing host", origin)
+	}
+	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return fmt.Errorf("invalid CORS origin %q: use scheme://host[:port] without a path, query or fragment", origin)
+	}
+	return nil
+}
+
+// validateLookupURL accepts an http(s) URL, optionally containing the %s
+// placeholder used to inject the JA4 fingerprint. The placeholder is
+// substituted before parsing because url.Parse rejects "%s" as an invalid
+// escape in a path.
+func validateLookupURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("-ja4-lookup-url must not be blank")
+	}
+	parsed, err := url.Parse(strings.ReplaceAll(trimmed, "%s", "ja4"))
+	if err != nil {
+		return fmt.Errorf("invalid -ja4-lookup-url %q: %w", raw, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("invalid -ja4-lookup-url %q: scheme must be http or https", raw)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("invalid -ja4-lookup-url %q: missing host", raw)
+	}
+	return nil
+}
+
+// validateListenAddr checks that -http-addr is a host:port pair whose port is
+// in range. It deliberately does not resolve the host: a name that is not
+// resolvable at flag time may still be valid at listen time.
+func validateListenAddr(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q is not a valid host:port: %w", addr, err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("%q has an invalid port %q (expected 0-65535)", addr, port)
+	}
+	return nil
+}
+
+// validateThresholds applies the -risk-*-threshold overrides on top of the
+// scorer defaults and requires the effective values to be strictly
+// increasing. deriveAction checks block, then challenge, then rate-limit, then
+// delay, so an out-of-order threshold silently makes the earlier action
+// unreachable instead of failing at startup.
+func validateThresholds(risk Risk) error {
+	effective := [4]int{
+		defaultDelayThreshold,
+		defaultRateLimitThreshold,
+		defaultChallengeThreshold,
+		defaultBlockThreshold,
+	}
+	overrides := [4]int{risk.DelayThreshold, risk.RateLimitThresh, risk.ChallengeThresh, risk.BlockThresh}
+	for i, override := range overrides {
+		if override >= 0 {
+			effective[i] = override
+		}
+	}
+	for i := 1; i < len(effective); i++ {
+		if effective[i-1] >= effective[i] {
+			return fmt.Errorf(
+				"risk thresholds must be strictly increasing (delay < rate-limit < challenge < block) after applying -risk-*-threshold overrides; got delay=%d rate-limit=%d challenge=%d block=%d",
+				effective[0], effective[1], effective[2], effective[3],
+			)
+		}
+	}
+	return nil
+}
+
+// Validate rejects configurations that would otherwise fail late in the
+// capture/scoring path (where the error is harder to attribute to a flag) or
+// that silently disable an action the operator asked for.
 func (c Config) Validate() error {
 	switch c.Capture.Backend {
 	case BackendPCAP, BackendEBPF:
-		return nil
 	default:
 		return fmt.Errorf("invalid -backend %q (expected %s or %s)", c.Capture.Backend, BackendPCAP, BackendEBPF)
 	}
+
+	if strings.TrimSpace(c.Capture.Interface) == "" {
+		return fmt.Errorf("-iface must not be empty")
+	}
+
+	// MatchPort is a uint because libpcap/XDP ports are unsigned; a value
+	// above 65535 would be rejected deep in capture.Open (or wrap inside the
+	// XDP port map) rather than at flag time.
+	if c.Capture.MatchPort > 65535 {
+		return fmt.Errorf("-port %d is out of range (0-65535)", c.Capture.MatchPort)
+	}
+
+	if err := validateThresholds(c.Risk); err != nil {
+		return err
+	}
+
+	if c.Risk.RedisDB < 0 {
+		return fmt.Errorf("-redis-db must be >= 0, got %d", c.Risk.RedisDB)
+	}
+	if c.Risk.RedisPoolSize < 1 {
+		return fmt.Errorf("-redis-pool-size must be >= 1, got %d", c.Risk.RedisPoolSize)
+	}
+	if c.Risk.RedisMinIdleConns < 0 {
+		return fmt.Errorf("-redis-min-idle-conns must be >= 0, got %d", c.Risk.RedisMinIdleConns)
+	}
+	if c.Risk.RedisConnectAttempts < 1 {
+		return fmt.Errorf("-redis-connect-attempts must be >= 1, got %d", c.Risk.RedisConnectAttempts)
+	}
+
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"-redis-dial-timeout", c.Risk.RedisDialTimeout},
+		{"-redis-read-timeout", c.Risk.RedisReadTimeout},
+		{"-redis-write-timeout", c.Risk.RedisWriteTimeout},
+		{"-redis-pool-timeout", c.Risk.RedisPoolTimeout},
+		{"-ja4-lookup-timeout", c.Risk.JA4LookupTimeout},
+		{"-ja4-cache-ttl", c.Risk.JA4CacheTTL},
+		{"-http-read-header-timeout", c.Observability.ReadHeaderTimeout},
+		{"-http-read-timeout", c.Observability.ReadTimeout},
+		{"-http-write-timeout", c.Observability.WriteTimeout},
+		{"-http-idle-timeout", c.Observability.IdleTimeout},
+	} {
+		if d.value <= 0 {
+			return fmt.Errorf("%s must be positive, got %s", d.name, d.value)
+		}
+	}
+
+	if c.Risk.JA4LookupURL != "" {
+		if err := validateLookupURL(c.Risk.JA4LookupURL); err != nil {
+			return err
+		}
+	}
+
+	for _, origin := range c.Observability.HTTPCORSOrigins {
+		if err := validateCORSOrigin(origin); err != nil {
+			return err
+		}
+	}
+
+	// An empty -http-addr disables the observability server (and /api), which
+	// is a supported deployment; only validate the address when it is set.
+	if strings.TrimSpace(c.Observability.HTTPAddr) != "" {
+		if err := validateListenAddr(c.Observability.HTTPAddr); err != nil {
+			return fmt.Errorf("invalid -http-addr: %w", err)
+		}
+	}
+
+	return nil
 }

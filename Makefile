@@ -1,4 +1,4 @@
-.PHONY: build test setup generate run run-pcap benchmark clean
+.PHONY: build test vet setup generate run run-pcap benchmark clean
 
 IFACE ?= wlan0
 
@@ -7,7 +7,10 @@ generate:
 
 build: generate
 	mkdir -p bin
-	go build -o bin/sybil main.go
+	go build -o bin/sybil .
+
+vet:
+	go vet ./...
 
 run: build
 	sudo ./bin/sybil -iface $(IFACE)

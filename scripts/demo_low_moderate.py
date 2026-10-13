@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def main() -> int:
     cmd = [
         sys.executable,
-        "scripts/demo_local_target_and_load.py",
+        str(SCRIPT_DIR / "demo_local_target_and_load.py"),
         "--port",
         "9443",
         "--warmup-seconds",

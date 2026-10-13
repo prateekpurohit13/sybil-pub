@@ -50,21 +50,43 @@ sudo ./bin/sybil -backend ebpf -iface wlan0
 ### Useful Flags
 
 ```text
--iface <name>           Network interface (default: lo)
--backend <pcap|ebpf>    Capture backend (default: pcap)
--port <n>               Filter to TCP flows where src or dst port matches
--hello-out <path>       Save first detected TLS hello record bytes to file
--exit-after-hello       Exit after first detected TLS hello
--redis-addr <addr>      Enable Redis-backed live threat scoring
--redis-password <pwd>   Redis password (prefer $SYBIL_REDIS_PASSWORD)
--redis-db <n>           Redis database number (default: 0)
--risk-key-prefix <key>  Redis prefix for scoring state
--ja4-lookup-url <url>   Optional JA4 enrichment URL or template
--ja4-db-url <url>       Optional libSQL/Turso JA4 database URL (prefer $DB_URL)
--ja4-db-auth-token <t>  Optional auth token for the JA4 database (prefer $AUTH_TOKEN)
--http-addr <addr>       HTTP listen address for /metrics and /healthz
--http-token <token>     Bearer token for /api endpoints (prefer $SYBIL_HTTP_TOKEN)
+-v                              Full hello output (hex dump, parsed fields, component scores)
+-iface <name>                   Capture interface: pcap device or XDP attach point (default: lo)
+-backend <pcap|ebpf>            Capture backend (default: pcap)
+-port <n>                       Filter to TCP flows where src or dst port matches (0 = all, max 65535)
+-hello-out <path>               Save first detected TLS hello record bytes to file
+-exit-after-hello               Exit after first detected TLS hello
+-redis-addr <addr>              Enable Redis-backed live threat scoring
+-redis-password <pwd>           Redis password (prefer $SYBIL_REDIS_PASSWORD)
+-redis-db <n>                   Redis database number, >= 0 (default: 0)
+-risk-key-prefix <key>          Redis prefix for scoring state
+-redis-dial-timeout <dur>       Dial timeout for Redis (default: 5s)
+-redis-read-timeout <dur>       Redis read timeout (default: 3s)
+-redis-write-timeout <dur>      Redis write timeout (default: 3s)
+-redis-pool-timeout <dur>       Wait for a pooled Redis connection (default: 4s)
+-redis-pool-size <n>            Maximum Redis connection pool size (default: 32)
+-redis-min-idle-conns <n>       Minimum idle Redis connections (default: 2)
+-redis-connect-attempts <n>     Startup connect attempts before capture-only mode (default: 3)
+-risk-delay-threshold <n>       Override delay threshold (default: 70; negative = scorer default)
+-risk-rate-limit-threshold <n>  Override rate-limit threshold (default: 80; negative = scorer default)
+-risk-challenge-threshold <n>   Override challenge threshold (default: 90; negative = scorer default)
+-risk-block-threshold <n>       Override block threshold (default: 95; negative = scorer default)
+-risk-use-host-fallback <bool>  Use SNI host as a weaker diversity signal (default: true)
+-ja4-lookup-url <url>           Optional JA4 enrichment URL or template with %s
+-ja4-lookup-timeout <dur>       Timeout for external JA4 lookups (default: 2s)
+-ja4-db-url <url>               Optional libSQL/Turso JA4 database URL (prefer $DB_URL)
+-ja4-db-auth-token <t>          Optional auth token for the JA4 database (prefer $AUTH_TOKEN)
+-ja4-cache-ttl <dur>            Redis TTL for cached JA4 lookups (default: 30m)
+-http-addr <addr>               Listen address for /metrics, /healthz and /api (default: 127.0.0.1:9090; empty disables)
+-http-token <token>             Bearer token for /api endpoints (prefer $SYBIL_HTTP_TOKEN)
+-http-cors-origins <list>       Comma-separated exact origins allowed to read /api cross-origin (default: none)
+-http-read-header-timeout <d>   Max time to read request headers (default: 5s)
+-http-read-timeout <dur>        Max time to read the whole request (default: 10s)
+-http-write-timeout <dur>       Max time to write a response (default: 10s)
+-http-idle-timeout <dur>        Max keep-alive idle time between requests (default: 60s)
 ```
+
+Configuration is validated at startup. Bad values fail fast instead of surfacing at runtime: unknown `-backend`, empty `-iface`, `-port` above 65535, non-monotonic `-risk-*-threshold` overrides, negative `-redis-db`, non-positive Redis/JA4/HTTP timeouts, an unparseable `-http-addr`, a `-ja4-lookup-url` that is not http(s), and malformed `-http-cors-origins` entries (for example an origin containing a path or missing the scheme; a trailing slash is normalized away).
 
 ### Live Threat Scoring
 
@@ -75,7 +97,7 @@ When `-redis-addr` is set, Sybil keeps rolling JA4+IP state in Redis and emits a
 - `burstiness` (25): the newest minute is compared against the median of the preceding active minutes, so a single-minute spike is scored even before three buckets exist.
 - `fingerprint_reputation` (15): JA4 DB metadata only nudges the score; it does not override behavior.
 
-Default actions:
+Default actions (each overridable with `-risk-delay-threshold`, `-risk-rate-limit-threshold`, `-risk-challenge-threshold` and `-risk-block-threshold`; the effective delay < rate-limit < challenge < block ordering is enforced at startup):
 
 - `70+`: add delay
 - `80+`: rate limit
@@ -103,8 +125,9 @@ Sybil now serves:
 
 - `GET /metrics`
 - `GET /healthz`
+- `GET /api/...` (read-only dashboard data: totals, timeseries, recent requests, top threats, fingerprint rankings)
 
-The default observability address is `:9090`.
+The default observability address is `127.0.0.1:9090` (loopback only, because `/api` exposes source/destination IPs, JA4 fingerprints and threat history). Pass `-http-addr :9090` to listen on all interfaces, or an empty `-http-addr` to disable the server. Protect a non-loopback listener with `-http-token` and list any browser origins that may read `/api` with `-http-cors-origins` (a wildcard is rejected).
 
 Bring up Redis, Prometheus, and Grafana:
 
@@ -179,6 +202,18 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
 - No `*_FILE` indirection is supported yet; inject these variables with your secret manager (Docker/Kubernetes secret env, systemd `EnvironmentFile`, etc.).
 - The Grafana `admin`/`admin` login, the passwordless Redis service, and the published `6379:6379` port in `docker-compose.yml` are local-dev defaults. Change the credentials and restrict the published ports before exposing the stack beyond localhost.
 
+### Known Limitations
+
+- TLS-over-TCP only: the sniffer reassembles TCP streams and parses TLS records, so QUIC/HTTP3 (UDP 443) and DTLS are not inspected. UDP traffic is ignored by both backends.
+- A TLS ClientHello exposes the SNI host but never the encrypted HTTP path. Endpoint-level diversity therefore falls back to host-level diversity (`-risk-use-host-fallback=false` disables it), and to a per-source-IP bucket when there is no SNI.
+- Actions are advisory. Sybil prints and persists the verdict; it never delays, rate-limits, challenges or blocks traffic. See the threat model note above.
+- Capture needs elevated privileges: run the binary with `sudo`, or with `CAP_NET_RAW` (and `CAP_NET_ADMIN`/`CAP_BPF` for XDP). The Docker image ships a non-root user and expects `--cap-add=NET_RAW --cap-add=NET_ADMIN --network=host`.
+- Risk scoring, the JA4 cache and the `/api` store require Redis. Without `-redis-addr` the sensor still captures and prints hellos; startup with an unreachable Redis degrades to capture-only mode instead of failing.
+
+## License
+
+MIT. The eBPF program in `ebpf/xdp_tcp.c` is dual MIT/GPL (the kernel requires a GPL-compatible license for the helpers it uses); see [LICENSE](LICENSE).
+
 ## References
 
 - https://blog.cloudflare.com/ja4-signals/
@@ -196,23 +231,23 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  C                         1          116           69           29           18
  CSS                       1          126          121            0            5
  Dockerfile                1           44           23           18            3
- Go                       41        10451         8425          894         1132
+ Go                       41        10816         8735          927         1154
  JavaScript                2           25           20            2            3
  JSON                      7        13554        13554            0            0
- Makefile                  1           29           20            0            9
- Python                    5          671          532           15          124
- Shell                     3          303          226           22           55
+ Makefile                  1           32           22            0           10
+ Python                    5          677          536           15          126
+ Shell                     3          318          236           25           57
  SVG                       5            5            5            0            0
  TSX                      17         1448         1326            6          116
  TypeScript                5          128           98           13           17
- Typst                     1          311          205           12           94
+ Typst                     1          301          200           12           89
  YAML                      5         8052         7466            0          586
 ─────────────────────────────────────────────────────────────────────────────────
- Markdown                  2          229            0          156           73
+ Markdown                  2          264            0          186           78
  |- BASH                   2           25           22            3            0
- (Total)                              254           22          159           73
+ (Total)                              289           22          189           78
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    97        35517        32112         1170         2235
+ Total                    97        35931        32433         1236         2262
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

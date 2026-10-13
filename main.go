@@ -23,6 +23,8 @@ import (
 	"github.com/sophic00/sybil/internal/stream"
 	"github.com/sophic00/sybil/internal/telemetry"
 	"github.com/sophic00/sybil/internal/tlshello"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -35,11 +37,15 @@ func main() {
 	defer cancel()
 
 	registry := telemetry.NewRegistry(cfg.Capture.Backend, cfg.Capture.Interface)
-	apiStore, closeAPIStore, err := newAPIStore(ctx, cfg.Risk)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer closeAPIStore()
+
+	// One Redis client is shared by the API store, the risk stats store and the
+	// JA4 lookup cache. Startup failure is degraded, not fatal: capture keeps
+	// running and healthz/metrics report the outage so an operator can fix it
+	// while the sensor still records traffic.
+	rdb, closeRedis := openRedisClient(ctx, cfg.Risk, registry)
+	defer closeRedis()
+
+	apiStore := newAPIStore(rdb, cfg.Risk)
 
 	closeHTTPServer, err := startHTTPServer(ctx, cfg.Observability, registry, apiStore)
 	if err != nil {
@@ -47,11 +53,9 @@ func main() {
 	}
 	defer closeHTTPServer()
 
-	threatScorer, closeThreatScorer, err := newThreatScorer(ctx, cfg.Risk, registry)
-	if err != nil {
-		log.Fatal(err)
-	}
+	threatScorer, closeThreatScorer := newThreatScorer(rdb, cfg.Risk, registry)
 	defer closeThreatScorer()
+	breaker := newRedisCircuit(registry, redisFailureThreshold, redisCooldown)
 
 	var helloOnce sync.Once
 	onHello := func(hello *tlshello.Hello) {
@@ -78,17 +82,25 @@ func main() {
 			observedAt := eventStart.UTC()
 			registry.RecordEvent(event)
 			printHelloEvent(event)
-			assessmentStart := time.Now()
-			assessment, err := assessClientHello(ctx, threatScorer, event, observedAt)
-			registry.ObserveDuration("assessment", time.Since(assessmentStart))
-			if err != nil {
-				log.Printf("risk assessment failed for %s: %v", event.JA4.Fingerprint, err)
-			} else if assessment != nil {
-				registry.RecordAssessment(*assessment)
-				if apiStore != nil {
-					if observation, ok := api.BuildObservation(event, assessment, observedAt); ok {
-						if err := apiStore.Record(ctx, observation); err != nil {
-							log.Printf("api persistence failed for %s: %v", observation.JA4Fingerprint, err)
+			if threatScorer != nil && breaker.allow(time.Now()) {
+				// The breaker is closed (or a cooldown probe is due). While it is
+				// open this block is skipped so capture is never blocked by
+				// failing Redis round trips; healthz reports degraded instead.
+				assessmentStart := time.Now()
+				assessment, err := assessClientHello(ctx, threatScorer, event, observedAt)
+				registry.ObserveDuration("assessment", time.Since(assessmentStart))
+				if err != nil {
+					log.Printf("risk assessment failed for %s: %v", event.JA4.Fingerprint, err)
+					breaker.failure(time.Now())
+				} else if assessment != nil {
+					breaker.success()
+					registry.RecordAssessment(*assessment)
+					if apiStore != nil {
+						if observation, ok := api.BuildObservation(event, assessment, observedAt); ok {
+							if err := apiStore.Record(ctx, observation); err != nil {
+								log.Printf("api persistence failed for %s: %v", observation.JA4Fingerprint, err)
+								breaker.failure(time.Now())
+							}
 						}
 					}
 				}
@@ -171,37 +183,16 @@ func main() {
 	}
 }
 
-func newAPIStore(ctx context.Context, cfg config.Risk) (api.Store, func(), error) {
-	if cfg.RedisAddr == "" {
-		return nil, func() {}, nil
+func newAPIStore(rdb *redis.Client, cfg config.Risk) api.Store {
+	if rdb == nil {
+		return nil
 	}
-
-	rdb, err := db.OpenRedis(ctx, db.RedisConfig{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
-	})
-	if err != nil {
-		return nil, func() {}, err
-	}
-
-	return api.NewRedisStore(rdb, cfg.KeyPrefix), func() {
-		_ = rdb.Close()
-	}, nil
+	return api.NewRedisStore(rdb, cfg.KeyPrefix)
 }
 
-func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.Registry) (*risk.Scorer, func(), error) {
-	if cfg.RedisAddr == "" {
-		return nil, func() {}, nil
-	}
-
-	rdb, err := db.OpenRedis(ctx, db.RedisConfig{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
-	})
-	if err != nil {
-		return nil, func() {}, err
+func newThreatScorer(rdb *redis.Client, cfg config.Risk, registry *telemetry.Registry) (*risk.Scorer, func()) {
+	if rdb == nil {
+		return nil, func() {}
 	}
 
 	riskCfg := risk.DefaultConfig()
@@ -225,7 +216,7 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 	}
 
 	var lookup risk.LookupClient
-	closeFns := []func(){func() { _ = rdb.Close() }}
+	closeFns := []func(){}
 	switch {
 	case cfg.JA4DBURL != "":
 		dbLookup, closeDB, err := risk.NewLibSQLLookupClient(db.SQLiteConfig{
@@ -234,7 +225,11 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 			AuthToken: cfg.JA4DBAuthToken,
 		})
 		if err != nil {
-			return nil, func() {}, err
+			// Behavioral scoring still works without enrichment, and the shared
+			// Redis client is owned by main (not this function), so a libSQL
+			// failure no longer leaks it or takes the sensor down.
+			log.Printf("ja4 libsql lookup unavailable: %v; continuing without enrichment", err)
+			return risk.NewScorer(store, nil, riskCfg), func() {}
 		}
 		closeFns = append(closeFns, closeDB)
 		lookup = dbLookup
@@ -253,7 +248,134 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 		for i := len(closeFns) - 1; i >= 0; i-- {
 			closeFns[i]()
 		}
-	}, nil
+	}
+}
+
+const (
+	redisFailureThreshold = 3
+	redisCooldown         = 30 * time.Second
+)
+
+// openRedisClient dials and pings Redis with bounded retry/backoff, then
+// returns a single shared client plus its close function. A failure is logged
+// and reported through the sybil_redis_up gauge / healthz, not fatal: the
+// sensor degrades to capture-only mode instead of refusing to start.
+func openRedisClient(ctx context.Context, cfg config.Risk, registry *telemetry.Registry) (*redis.Client, func()) {
+	if strings.TrimSpace(cfg.RedisAddr) == "" {
+		return nil, func() {}
+	}
+
+	attempts := cfg.RedisConnectAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := 500 * time.Millisecond
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		rdb, err := db.OpenRedis(ctx, db.RedisConfig{
+			Addr:         cfg.RedisAddr,
+			Password:     cfg.RedisPassword,
+			DB:           cfg.RedisDB,
+			DialTimeout:  cfg.RedisDialTimeout,
+			ReadTimeout:  cfg.RedisReadTimeout,
+			WriteTimeout: cfg.RedisWriteTimeout,
+			PoolTimeout:  cfg.RedisPoolTimeout,
+			PoolSize:     cfg.RedisPoolSize,
+			MinIdleConns: cfg.RedisMinIdleConns,
+		})
+		if err == nil {
+			if registry != nil {
+				registry.SetRedisUp(true)
+			}
+			return rdb, func() { _ = rdb.Close() }
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			if registry != nil {
+				registry.SetRedisUp(false)
+			}
+			log.Printf("redis connect canceled at %s: %v; continuing in capture-only mode", cfg.RedisAddr, ctx.Err())
+			return nil, func() {}
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > 8*time.Second {
+			backoff = 8 * time.Second
+		}
+	}
+
+	if registry != nil {
+		registry.SetRedisUp(false)
+	}
+	log.Printf("redis unavailable at %s after %d attempt(s): %v; continuing in capture-only mode (risk scoring and API endpoints disabled)", cfg.RedisAddr, attempts, lastErr)
+	return nil, func() {}
+}
+
+// redisCircuit is a small breaker around the shared Redis client. Repeated
+// runtime failures (for example Redis restarting under load) trip it open; the
+// capture loop then stops calling assess/persist for a cooldown period and
+// healthz reports degraded instead of every hello paying a failing round
+// trip. One probe is allowed after the cooldown (half-open); a success closes
+// the breaker and restores sybil_redis_up.
+type redisCircuit struct {
+	registry  *telemetry.Registry
+	threshold int
+	cooldown  time.Duration
+
+	mu        sync.Mutex
+	failures  int
+	openUntil time.Time
+	degraded  bool
+}
+
+func newRedisCircuit(registry *telemetry.Registry, threshold int, cooldown time.Duration) *redisCircuit {
+	if threshold < 1 {
+		threshold = 1
+	}
+	return &redisCircuit{registry: registry, threshold: threshold, cooldown: cooldown}
+}
+
+func (c *redisCircuit) allow(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.openUntil.IsZero() {
+		return true
+	}
+	return !now.Before(c.openUntil)
+}
+
+func (c *redisCircuit) success() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failures = 0
+	c.openUntil = time.Time{}
+	if c.degraded {
+		c.degraded = false
+		if c.registry != nil {
+			c.registry.SetRedisUp(true)
+		}
+	}
+}
+
+func (c *redisCircuit) failure(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failures++
+	if c.failures < c.threshold {
+		return
+	}
+	c.openUntil = now.Add(c.cooldown)
+	if !c.degraded {
+		c.degraded = true
+		if c.registry != nil {
+			c.registry.SetRedisUp(false)
+		}
+	}
 }
 
 func printHelloEvent(event stream.Event) {

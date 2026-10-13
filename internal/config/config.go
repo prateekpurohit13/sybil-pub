@@ -45,6 +45,15 @@ type Risk struct {
 	RateLimitThresh  int
 	ChallengeThresh  int
 	BlockThresh      int
+
+	// Redis connection tuning for the single shared client.
+	RedisDialTimeout     time.Duration
+	RedisReadTimeout     time.Duration
+	RedisWriteTimeout    time.Duration
+	RedisPoolTimeout     time.Duration
+	RedisPoolSize        int
+	RedisMinIdleConns    int
+	RedisConnectAttempts int
 }
 
 type Observability struct {
@@ -65,6 +74,13 @@ func Parse() Config {
 	flag.StringVar(&cfg.Risk.RedisPassword, "redis-password", "", "Redis password for live JA4 risk scoring")
 	flag.IntVar(&cfg.Risk.RedisDB, "redis-db", 0, "Redis database for live JA4 risk scoring")
 	flag.StringVar(&cfg.Risk.KeyPrefix, "risk-key-prefix", "sybil:risk", "Redis key prefix for live JA4 risk scoring")
+	flag.DurationVar(&cfg.Risk.RedisDialTimeout, "redis-dial-timeout", 5*time.Second, "Timeout for dialing Redis")
+	flag.DurationVar(&cfg.Risk.RedisReadTimeout, "redis-read-timeout", 3*time.Second, "Timeout for Redis reads")
+	flag.DurationVar(&cfg.Risk.RedisWriteTimeout, "redis-write-timeout", 3*time.Second, "Timeout for Redis writes")
+	flag.DurationVar(&cfg.Risk.RedisPoolTimeout, "redis-pool-timeout", 4*time.Second, "Timeout waiting for a pooled Redis connection")
+	flag.IntVar(&cfg.Risk.RedisPoolSize, "redis-pool-size", 32, "Maximum Redis connection pool size")
+	flag.IntVar(&cfg.Risk.RedisMinIdleConns, "redis-min-idle-conns", 2, "Minimum idle Redis connections to keep warm")
+	flag.IntVar(&cfg.Risk.RedisConnectAttempts, "redis-connect-attempts", 3, "Startup Redis connect attempts before degrading to capture-only mode")
 	flag.StringVar(&cfg.Risk.JA4LookupURL, "ja4-lookup-url", "", "Optional JA4 lookup URL or template. Use %s to inject the URL-escaped JA4 fingerprint")
 	flag.DurationVar(&cfg.Risk.JA4LookupTimeout, "ja4-lookup-timeout", 2*time.Second, "Timeout for external JA4 enrichment lookups")
 	flag.StringVar(&cfg.Risk.JA4DBURL, "ja4-db-url", os.Getenv("DB_URL"), "Optional libSQL/Turso URL for JA4 enrichment")

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sophic00/sybil/internal/parser"
@@ -104,6 +105,11 @@ type Registry struct {
 	captureDropped   uint64
 	captureIfDropped uint64
 
+	// redisUp is -1 until the process first reports Redis state (no Redis
+	// configured), 0 when the shared client is unreachable (capture-only
+	// degraded mode), and 1 when it is reachable.
+	redisUp atomic.Int32
+
 	logMu         sync.Mutex
 	unknownLogged map[string]time.Time
 }
@@ -115,6 +121,7 @@ func NewRegistry(backend, iface string) *Registry {
 		dropped:       make(map[string]uint64),
 		unknownLogged: make(map[string]time.Time),
 	}
+	r.redisUp.Store(-1)
 
 	r.registerGauge("sybil_runtime_info", "Static runtime metadata for the active Sybil process", nil)
 	r.registerCounter("sybil_capture_packets_total", "Packets delivered to the stream processor")
@@ -136,6 +143,7 @@ func NewRegistry(backend, iface string) *Registry {
 	r.registerHistogram("sybil_processing_duration_seconds", "Pipeline processing durations", []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
 	r.registerCounter("sybil_redis_record_total", "Redis-backed stats store outcomes")
 	r.registerHistogram("sybil_redis_record_duration_seconds", "Redis-backed stats store durations", []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
+	r.registerGauge("sybil_redis_up", "Whether the shared Redis client is reachable (1) or the sensor is in capture-only degraded mode (0)", nil)
 	r.registerCounter(seriesDroppedMetric, "Metric series and observations dropped because a metric exceeded its cardinality limit or was not registered")
 	r.registerCounter("sybil_capture_pcap_received_total", "Packets received by the libpcap backend (kernel counter)")
 	r.registerCounter("sybil_capture_pcap_dropped_total", "Packets dropped by libpcap because its kernel buffer was full")
@@ -324,6 +332,21 @@ func (r *Registry) ObserveDuration(stage string, duration time.Duration) {
 	}, duration.Seconds())
 }
 
+// SetRedisUp records whether the single shared Redis client is reachable. It
+// backs the sybil_redis_up gauge and the /healthz degraded status so a Redis
+// outage is visible to operators instead of silently disabling risk scoring.
+func (r *Registry) SetRedisUp(up bool) {
+	if r == nil {
+		return
+	}
+	value := int32(0)
+	if up {
+		value = 1
+	}
+	r.redisUp.Store(value)
+	r.Set("sybil_redis_up", nil, float64(value))
+}
+
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -333,13 +356,21 @@ func (r *Registry) Handler() http.Handler {
 
 func (r *Registry) HealthHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		payload, _ := json.Marshal(map[string]any{
+		payload := map[string]any{
 			"status":  "ok",
 			"uptime":  time.Since(r.started).String(),
 			"started": r.started.UTC().Format(time.RFC3339),
-		})
-		_, _ = w.Write(payload)
+		}
+		switch r.redisUp.Load() {
+		case 1:
+			payload["redis"] = "up"
+		case 0:
+			payload["redis"] = "down"
+			payload["status"] = "degraded"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		data, _ := json.Marshal(payload)
+		_, _ = w.Write(data)
 	})
 }
 

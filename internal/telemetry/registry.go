@@ -144,6 +144,7 @@ func NewRegistry(backend, iface string) *Registry {
 	r.registerCounter("sybil_redis_record_total", "Redis-backed stats store outcomes")
 	r.registerHistogram("sybil_redis_record_duration_seconds", "Redis-backed stats store durations", []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
 	r.registerGauge("sybil_redis_up", "Whether the shared Redis client is reachable (1) or the sensor is in capture-only degraded mode (0)", nil)
+	r.registerCounter("sybil_scoring_dropped_total", "Per-event risk scoring/persistence jobs dropped because the bounded worker queue was full")
 	r.registerCounter(seriesDroppedMetric, "Metric series and observations dropped because a metric exceeded its cardinality limit or was not registered")
 	r.registerCounter("sybil_capture_pcap_received_total", "Packets received by the libpcap backend (kernel counter)")
 	r.registerCounter("sybil_capture_pcap_dropped_total", "Packets dropped by libpcap because its kernel buffer was full")

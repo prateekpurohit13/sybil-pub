@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -34,6 +35,11 @@ type Options struct {
 
 type Processor struct {
 	matchPort uint
+	// mu serializes every assembler call. tcpassembly.Assembler is explicitly
+	// not safe for concurrent use, and the capture goroutine (ProcessPacket)
+	// runs alongside the flush ticker (FlushOlderThan) and the shutdown drain
+	// (FlushAll). The lock is held only across the assembler call itself.
+	mu        sync.Mutex
 	assembler *tcpassembly.Assembler
 }
 
@@ -85,10 +91,14 @@ func (p *Processor) ProcessPacket(packet gopacket.Packet) {
 		timestamp = metadata.Timestamp
 	}
 
+	p.mu.Lock()
 	p.assembler.AssembleWithTimestamp(netFlow, tcp, timestamp)
+	p.mu.Unlock()
 }
 
 func (p *Processor) FlushOlderThan(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.assembler.FlushOlderThan(t)
 }
 
@@ -99,6 +109,8 @@ func (p *Processor) FlushAll() {
 	if p == nil || p.assembler == nil {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.assembler.FlushAll()
 }
 

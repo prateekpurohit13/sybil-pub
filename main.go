@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"os"
@@ -23,11 +25,36 @@ import (
 	"github.com/sophic00/sybil/internal/stream"
 	"github.com/sophic00/sybil/internal/telemetry"
 	"github.com/sophic00/sybil/internal/tlshello"
+	"github.com/sophic00/sybil/internal/worker"
 
 	"github.com/redis/go-redis/v9"
 )
 
+const (
+	// scoringWorkers is the size of the risk scoring/persistence pool. Scoring
+	// and enrichment are I/O-bound (Redis round trips, libSQL queries, HTTP
+	// lookups), so a handful of workers absorb bursts without stalling capture.
+	scoringWorkers = 8
+	// scoringQueueSize bounds the number of hellos waiting to be scored across
+	// all workers. A burst beyond this is dropped (and counted) rather than
+	// delaying packet capture and backing up the pcap/kernel buffers.
+	scoringQueueSize = 4096
+	// scoringEventTimeout bounds one scoring job end to end (stats record,
+	// enrichment lookup, persistence), including a hung libSQL query or HTTP
+	// lookup. It is deliberately below the default Redis read timeout so the
+	// job deadline wins.
+	scoringEventTimeout = time.Second
+	// scoringDrainTimeout bounds how long shutdown waits for queued scoring
+	// before cancelling it.
+	scoringDrainTimeout = 5 * time.Second
+
+	// flushInterval / flushIdleAge drive the periodic idle-stream flush.
+	flushInterval = time.Second
+	flushIdleAge  = 3 * time.Second
+)
+
 func main() {
+	verbose := flag.Bool("v", verboseFromEnv(), "Print full hello details (hex dump, parsed fields, per-component scores) for every event")
 	cfg := config.Parse()
 	if err := cfg.Validate(); err != nil {
 		log.Fatal(err)
@@ -71,6 +98,29 @@ func main() {
 		})
 	}
 
+	// Scoring and persistence run on a bounded worker pool so a slow Redis,
+	// libSQL or HTTP enrichment call can never stall the packet capture
+	// goroutine. Jobs are sharded by (JA4, source IP): the risk Redis store's
+	// stale-bucket cleanup reads and deletes values in one call, which is only
+	// race-free while a single writer owns a pair's keys. Sharding keeps that
+	// invariant per pair while different pairs are scored in parallel.
+	pool := worker.New[scoringJob](ctx, worker.Options[scoringJob]{
+		Workers:      scoringWorkers,
+		QueueSize:    scoringQueueSize,
+		Timeout:      scoringEventTimeout,
+		DrainTimeout: scoringDrainTimeout,
+		ShardOf:      scoringShard,
+		OnDrop: func() {
+			registry.Inc("sybil_scoring_dropped_total", nil)
+		},
+		Handler: func(jobCtx context.Context, job scoringJob) {
+			processScoringJob(jobCtx, job, threatScorer, apiStore, breaker, registry, *verbose)
+		},
+	})
+	// Registered before FlushAll so the pool stays open while the shutdown
+	// flush still enqueues buffered hellos (defers run LIFO).
+	defer pool.Close()
+
 	processor := stream.NewProcessor(stream.Options{
 		MatchPort: cfg.Capture.MatchPort,
 		OnEvent: func(event stream.Event) {
@@ -79,33 +129,16 @@ func main() {
 			}
 
 			eventStart := time.Now()
-			observedAt := eventStart.UTC()
 			registry.RecordEvent(event)
-			printHelloEvent(event)
-			if threatScorer != nil && breaker.allow(time.Now()) {
-				// The breaker is closed (or a cooldown probe is due). While it is
-				// open this block is skipped so capture is never blocked by
-				// failing Redis round trips; healthz reports degraded instead.
-				assessmentStart := time.Now()
-				assessment, err := assessClientHello(ctx, threatScorer, event, observedAt)
-				registry.ObserveDuration("assessment", time.Since(assessmentStart))
-				if err != nil {
-					log.Printf("risk assessment failed for %s: %v", event.JA4.Fingerprint, err)
-					breaker.failure(time.Now())
-				} else if assessment != nil {
-					breaker.success()
-					registry.RecordAssessment(*assessment)
-					if apiStore != nil {
-						if observation, ok := api.BuildObservation(event, assessment, observedAt); ok {
-							if err := apiStore.Record(ctx, observation); err != nil {
-								log.Printf("api persistence failed for %s: %v", observation.JA4Fingerprint, err)
-								breaker.failure(time.Now())
-							}
-						}
-					}
-				}
-			}
+			printHelloEvent(event, *verbose)
 			onHello(event.Hello)
+
+			// Hand the expensive work off without blocking capture. A full queue
+			// drops the event and increments sybil_scoring_dropped_total instead
+			// of backing packets up into the pcap/kernel buffers.
+			if threatScorer != nil && event.Fields != nil && event.JA4 != nil {
+				pool.TrySubmit(scoringJob{event: event, observedAt: eventStart.UTC()})
+			}
 			registry.ObserveDuration("event", time.Since(eventStart))
 		},
 		OnExtractError: func(err error) {
@@ -117,7 +150,7 @@ func main() {
 		},
 	})
 	// Flush at shutdown so hellos still buffered in half-open streams are
-	// not dropped when capture stops.
+	// not dropped when capture stops. This runs before pool.Close.
 	defer processor.FlushAll()
 
 	source, err := capture.Open(cfg.Capture)
@@ -130,13 +163,44 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	ticker := time.NewTicker(time.Second * 1)
-	defer ticker.Stop()
-
 	go func() {
 		<-sig
 		cancel()
 	}()
+
+	// Idle-stream flush and capture counters run on a dedicated ticker
+	// goroutine. Blocking in NextPacket on an idle interface used to gate
+	// FlushOlderThan on packet arrival, so half-open streams could sit
+	// unflushed indefinitely. stream.Processor serializes assembler access.
+	go runPeriodicFlush(ctx, processor, source, registry)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		packet, err := source.NextPacket(ctx)
+		if err != nil {
+			if errors.Is(err, capture.ErrClosed) || errors.Is(err, context.Canceled) {
+				return
+			}
+			registry.RecordCaptureError(err)
+			log.Printf("capture read failed: %v", err)
+			continue
+		}
+		registry.RecordCapturePacket()
+		processor.ProcessPacket(packet)
+	}
+}
+
+// runPeriodicFlush flushes idle streams and publishes capture counters once
+// per second, independent of packet arrival. It is safe to run alongside the
+// capture goroutine because stream.Processor serializes every assembler
+// access.
+func runPeriodicFlush(ctx context.Context, processor *stream.Processor, source *capture.Source, registry *telemetry.Registry) {
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
 
 	var lastLostSamples, lastMalformedSamples uint64
 	for {
@@ -144,11 +208,11 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Periodically flush old streams to trigger reassembly
-			processor.FlushOlderThan(time.Now().Add(-time.Second * 3))
+			processor.FlushOlderThan(time.Now().Add(-flushIdleAge))
+
 			// The eBPF backend reports dropped/malformed samples through
-			// counters instead of per-batch errors, so publish deltas here
-			// and keep a busy interface from flooding the logs.
+			// counters instead of per-batch errors, so publish deltas here and
+			// keep a busy interface from flooding the logs.
 			if lost := source.LostSamples(); lost > lastLostSamples {
 				registry.Add("sybil_capture_errors_total", telemetry.Labels{"kind": "lost_samples"}, float64(lost-lastLostSamples))
 				lastLostSamples = lost
@@ -167,19 +231,19 @@ func main() {
 					IfDropped: stats.IfDropped,
 				})
 			}
-		default:
-			packet, err := source.NextPacket(ctx)
-			if err != nil {
-				if errors.Is(err, capture.ErrClosed) || errors.Is(err, context.Canceled) {
-					return
-				}
-				registry.RecordCaptureError(err)
-				log.Printf("capture read failed: %v", err)
-				continue
-			}
-			registry.RecordCapturePacket()
-			processor.ProcessPacket(packet)
 		}
+	}
+}
+
+// verboseFromEnv lets SYBIL_VERBOSE=1 enable full hello output without
+// changing the command line, for example when the sensor is managed by a
+// process supervisor.
+func verboseFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SYBIL_VERBOSE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -378,7 +442,74 @@ func (c *redisCircuit) failure(now time.Time) {
 	}
 }
 
-func printHelloEvent(event stream.Event) {
+type scoringJob struct {
+	event      stream.Event
+	observedAt time.Time
+}
+
+// scoringShard hashes the (JA4, source IP) pair so every event for one pair is
+// handled by the same worker in order. The risk Redis store prunes stale
+// minute/resource buckets using values it read in the same call, which is only
+// race-free while a single writer owns a pair's keys.
+func scoringShard(job scoringJob) uint64 {
+	h := fnv.New64a()
+	if job.event.JA4 != nil {
+		_, _ = h.Write([]byte(job.event.JA4.Fingerprint))
+	}
+	_, _ = h.Write([]byte{'|'})
+	_, _ = h.Write([]byte(job.event.NetFlow.Src().String()))
+	return h.Sum64()
+}
+
+// processScoringJob runs the I/O-heavy part of the pipeline on a worker
+// goroutine. jobCtx carries the per-event deadline from the worker pool, so a
+// hung Redis command, libSQL query or enrichment HTTP call is abandoned and
+// its event is dropped instead of occupying the worker forever.
+func processScoringJob(jobCtx context.Context, job scoringJob, threatScorer *risk.Scorer, apiStore api.Store, breaker *redisCircuit, registry *telemetry.Registry, verbose bool) {
+	if threatScorer == nil || job.event.Fields == nil || job.event.JA4 == nil {
+		return
+	}
+
+	start := time.Now()
+	// The breaker is closed (or a cooldown probe is due). While it is open this
+	// job is skipped so failing Redis round trips stop consuming workers;
+	// healthz reports degraded instead.
+	if !breaker.allow(time.Now()) {
+		registry.ObserveDuration("scoring", time.Since(start))
+		return
+	}
+
+	assessmentStart := time.Now()
+	assessment, err := assessClientHello(jobCtx, threatScorer, job.event, job.observedAt)
+	registry.ObserveDuration("assessment", time.Since(assessmentStart))
+	if err != nil {
+		log.Printf("risk assessment failed for %s: %v", job.event.JA4.Fingerprint, err)
+		breaker.failure(time.Now())
+	} else if assessment != nil {
+		breaker.success()
+		registry.RecordAssessment(*assessment)
+		printAssessment(assessment, verbose)
+		if apiStore != nil {
+			if observation, ok := api.BuildObservation(job.event, assessment, job.observedAt); ok {
+				if err := apiStore.Record(jobCtx, observation); err != nil {
+					log.Printf("api persistence failed for %s: %v", observation.JA4Fingerprint, err)
+					breaker.failure(time.Now())
+				}
+			}
+		}
+	}
+	registry.ObserveDuration("scoring", time.Since(start))
+}
+
+func printHelloEvent(event stream.Event, verbose bool) {
+	if event.Hello == nil {
+		return
+	}
+	if !verbose {
+		printHelloSummary(event)
+		return
+	}
+
 	fmt.Printf("\n--- Detected TLS %s (%s:%s -> %s:%s) ---\n",
 		event.Hello.Type, event.NetFlow.Src(), event.TransportFlow.Src(), event.NetFlow.Dst(), event.TransportFlow.Dst())
 	fmt.Printf("record_bytes=%d handshake_bytes=%d stream_offset=%d\n",
@@ -418,6 +549,36 @@ func printHelloEvent(event stream.Event) {
 	fmt.Printf("JA4: %s\n", ja4.Fingerprint)
 }
 
+// printHelloSummary is the non-verbose hello line. It intentionally avoids the
+// per-hello hex.Dump and the multi-line parsed-field table, which dominated
+// stdout and lock cost when hellos arrived in bursts.
+func printHelloSummary(event stream.Event) {
+	if event.Hello == nil {
+		return
+	}
+	if event.Hello.Type != tlshello.ClientHello {
+		fmt.Printf("TLS %s %s:%s -> %s:%s\n", event.Hello.Type,
+			event.NetFlow.Src(), event.TransportFlow.Src(),
+			event.NetFlow.Dst(), event.TransportFlow.Dst())
+		return
+	}
+
+	ja4 := "-"
+	if event.JA4 != nil {
+		ja4 = event.JA4.Fingerprint
+	}
+	sni := "-"
+	if event.Fields != nil && strings.TrimSpace(event.Fields.SNIHost) != "" {
+		sni = event.Fields.SNIHost
+	}
+	fmt.Printf("TLS ClientHello %s:%s -> %s:%s ja4=%s sni=%s\n",
+		event.NetFlow.Src(), event.TransportFlow.Src(),
+		event.NetFlow.Dst(), event.TransportFlow.Dst(), ja4, sni)
+	if event.ParseError != nil {
+		fmt.Printf("  ClientHello parse error: %v\n", event.ParseError)
+	}
+}
+
 func assessClientHello(ctx context.Context, threatScorer *risk.Scorer, event stream.Event, observedAt time.Time) (*risk.Assessment, error) {
 	if threatScorer == nil || event.Fields == nil || event.JA4 == nil {
 		return nil, nil
@@ -436,13 +597,26 @@ func assessClientHello(ctx context.Context, threatScorer *risk.Scorer, event str
 		return nil, err
 	}
 
-	// Advisory only: this label is printed and persisted for operators/API
-	// consumers, but nothing on the capture path enforces it.
+	return &assessment, nil
+}
+
+// printAssessment renders the advisory verdict. The per-component table is
+// verbose-only: it is multi-line, contains no capture-critical information,
+// and printing it per hello at traffic rate dominated stdout.
+func printAssessment(assessment *risk.Assessment, verbose bool) {
+	if assessment == nil {
+		return
+	}
+
 	fmt.Printf("Threat Score: %d/100 action=%s", assessment.Score, assessment.Action)
 	if assessment.Delay > 0 {
 		fmt.Printf(" delay=%s", assessment.Delay)
 	}
 	fmt.Println()
+	if !verbose {
+		return
+	}
+
 	for _, component := range assessment.Components {
 		fmt.Printf("  %-20s %2d/%-2d %s\n", component.Name+":", component.Score, component.Weight, component.Detail)
 	}
@@ -455,7 +629,6 @@ func assessClientHello(ctx context.Context, threatScorer *risk.Scorer, event str
 		fmt.Printf("  app_family           %s\n", assessment.Summary.ApplicationFamily)
 		fmt.Printf("  os_family            %s\n", assessment.Summary.OSFamily)
 	}
-	return &assessment, nil
 }
 
 func startHTTPServer(ctx context.Context, cfg config.Observability, registry *telemetry.Registry, apiStore api.Store) (func(), error) {

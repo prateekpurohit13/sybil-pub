@@ -2,9 +2,13 @@ package stream
 
 import (
 	"encoding/binary"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/tcpassembly"
 )
 
@@ -95,4 +99,73 @@ func TestStreamParsesMultiRecordClientHello(t *testing.T) {
 	if event.Fields.RecordVersion != 0x0303 {
 		t.Errorf("RecordVersion = 0x%04x, want 0x0303", event.Fields.RecordVersion)
 	}
+}
+
+// streamTestPacket builds a minimal TCP SYN packet so ProcessPacket can be
+// driven concurrently with the flush ticker.
+func streamTestPacket(t *testing.T, srcPort layers.TCPPort) gopacket.Packet {
+	t.Helper()
+
+	eth := &layers.Ethernet{
+		SrcMAC:       net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+		DstMAC:       net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02},
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolTCP,
+		SrcIP:    net.IP{10, 0, 0, 1},
+		DstIP:    net.IP{10, 0, 0, 2},
+	}
+	tcp := &layers.TCP{
+		SrcPort: srcPort,
+		DstPort: 443,
+		Seq:     1,
+		SYN:     true,
+		Window:  65535,
+	}
+	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
+		t.Fatalf("set network layer: %v", err)
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}, eth, ip, tcp); err != nil {
+		t.Fatalf("serialize packet: %v", err)
+	}
+	return gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+}
+
+// TestProcessorConcurrentProcessAndFlush guards the mutex that makes the
+// dedicated flush ticker safe alongside packet capture: tcpassembly.Assembler
+// is not safe for concurrent use, so ProcessPacket and FlushOlderThan must
+// serialize on it. Run with -race to make this test meaningful.
+func TestProcessorConcurrentProcessAndFlush(t *testing.T) {
+	processor := NewProcessor(Options{MatchPort: 443})
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		packet := streamTestPacket(t, layers.TCPPort(20000+worker))
+		wg.Add(1)
+		go func(packet gopacket.Packet) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				processor.ProcessPacket(packet)
+				processor.FlushOlderThan(time.Now())
+			}
+		}(packet)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent ProcessPacket/FlushOlderThan deadlocked")
+	}
+	processor.FlushAll()
 }

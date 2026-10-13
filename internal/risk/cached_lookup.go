@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,6 +34,23 @@ type CachedLookupClient struct {
 	keyFn    func(string) string
 	ttl      time.Duration
 	observer LookupObserver
+
+	// inflight deduplicates concurrent origin lookups for the same JA4. The
+	// cache absorbs repeated fingerprints, but a burst of identical JA4s can
+	// all miss the cache before the first response is written, and nothing in
+	// Redis prevents N identical libSQL/HTTP requests from being issued at
+	// once. Followers wait for the leader's result instead.
+	inflightMu sync.Mutex
+	inflight   map[string]*inflightLookup
+}
+
+// inflightLookup is one origin lookup shared by every concurrent caller for
+// the same cache key. Followers wait on done and then read the leader's
+// record/err, so the enrichment backend sees a single request per JA4 burst.
+type inflightLookup struct {
+	done   chan struct{}
+	record *FingerprintRecord
+	err    error
 }
 
 type cachedLookupEntry struct {
@@ -67,7 +85,8 @@ func (c *CachedLookupClient) Lookup(ctx context.Context, ja4 string) (*Fingerpri
 		return nil, nil
 	}
 
-	cacheKey := c.keyFn(strings.TrimSpace(ja4))
+	trimmed := strings.TrimSpace(ja4)
+	cacheKey := c.keyFn(trimmed)
 	cacheStart := time.Now()
 	cachedValue, err := c.redis.Get(ctx, cacheKey).Result()
 	switch {
@@ -91,6 +110,30 @@ func (c *CachedLookupClient) Lookup(ctx context.Context, ja4 string) (*Fingerpri
 		c.observe("cache", "error", time.Since(cacheStart))
 	}
 
+	flight, leader := c.beginFlight(cacheKey)
+	if !leader {
+		// A lookup for this JA4 is already in flight. Wait for its result
+		// instead of issuing a duplicate enrichment request.
+		c.observe("singleflight", "joined", 0)
+		joinStart := time.Now()
+		select {
+		case <-flight.done:
+			c.observe("singleflight", "done", time.Since(joinStart))
+			return flight.record, flight.err
+		case <-ctx.Done():
+			c.observe("singleflight", "canceled", time.Since(joinStart))
+			return nil, ctx.Err()
+		}
+	}
+
+	record, lookupErr := c.lookupOrigin(ctx, trimmed, cacheKey)
+	c.finishFlight(cacheKey, flight, record, lookupErr)
+	return record, lookupErr
+}
+
+// lookupOrigin performs one origin lookup and writes the cache entry. Only
+// the single-flight leader calls it.
+func (c *CachedLookupClient) lookupOrigin(ctx context.Context, ja4, cacheKey string) (*FingerprintRecord, error) {
 	originStart := time.Now()
 	record, lookupErr := c.client.Lookup(ctx, ja4)
 	switch {
@@ -110,6 +153,35 @@ func (c *CachedLookupClient) Lookup(ctx context.Context, ja4 string) (*Fingerpri
 		c.writeCache(ctx, cacheKey, cachedLookupEntry{Status: "hit", Record: record})
 		return record, nil
 	}
+}
+
+// beginFlight registers the caller as the leader for key, or returns the
+// existing in-flight lookup when one is already running. leader is true only
+// for the caller that registered the flight.
+func (c *CachedLookupClient) beginFlight(key string) (flight *inflightLookup, leader bool) {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
+	if c.inflight == nil {
+		c.inflight = make(map[string]*inflightLookup)
+	}
+	if existing, ok := c.inflight[key]; ok {
+		return existing, false
+	}
+	flight = &inflightLookup{done: make(chan struct{})}
+	c.inflight[key] = flight
+	return flight, true
+}
+
+// finishFlight publishes the leader's result to every waiter and removes the
+// flight. Waiters read record/err after <-done, which is ordered after the
+// writes below by the channel close.
+func (c *CachedLookupClient) finishFlight(key string, flight *inflightLookup, record *FingerprintRecord, err error) {
+	c.inflightMu.Lock()
+	delete(c.inflight, key)
+	flight.record = record
+	flight.err = err
+	c.inflightMu.Unlock()
+	close(flight.done)
 }
 
 func (c *CachedLookupClient) writeCache(ctx context.Context, key string, entry cachedLookupEntry) {

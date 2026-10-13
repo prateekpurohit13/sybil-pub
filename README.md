@@ -182,7 +182,7 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  C                         1          116           69           29           18
  CSS                       1          126          121            0            5
  Dockerfile                1           44           23           18            3
- Go                       37         9063         7349          720          994
+ Go                       40         9965         8030          851         1084
  JavaScript                2           25           20            2            3
  JSON                      7        13553        13553            0            0
  Makefile                  1           29           20            0            9
@@ -191,13 +191,14 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  SVG                       5            5            5            0            0
  TSX                      16         1349         1235            2          112
  TypeScript                5          257          214            4           39
+ Typst                     1          289          190           13           86
  YAML                      5         8052         7466            0          586
 ─────────────────────────────────────────────────────────────────────────────────
  Markdown                  2          215            0          144           71
  |- BASH                   2           24           21            3            0
  (Total)                              239           21          147           71
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    91        33832        30854          959         2019
+ Total                    95        35023        31725         1103         2195
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

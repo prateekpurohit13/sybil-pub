@@ -198,7 +198,12 @@ func (s *Scorer) Assess(ctx context.Context, obs Observation) (Assessment, error
 	if s.lookup != nil {
 		record, lookupErr = s.lookup.Lookup(ctx, obs.JA4)
 		if record != nil && record.JA4Fingerprint == "" {
-			record.JA4Fingerprint = obs.JA4
+			// Copy before stamping. With the worker pool, several goroutines can
+			// hold the same record (single-flight joiners or a cached pointer),
+			// so mutating the lookup result in place would be a data race.
+			stamped := *record
+			stamped.JA4Fingerprint = obs.JA4
+			record = &stamped
 		}
 	}
 	summary := SummarizeFingerprint(record, lookupErr, s.lookup != nil)

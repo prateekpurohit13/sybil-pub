@@ -23,7 +23,7 @@ type ClientHelloFields struct {
 	TLSVersion    uint16
 
 	// SNI metadata:
-	// SNIType is "d" when hostname exists, else "i".
+	// SNIType is "d" when the SNI extension is present, else "i".
 	SNIType string
 	SNIHost string
 
@@ -57,7 +57,7 @@ func ParseClientHello(payload []byte) (*ClientHelloFields, error) {
 	input := cryptobyte.String(payload)
 	info := &ClientHelloFields{
 		Protocol: "t",
-		SNIType:  "i", // default: no valid hostname in SNI
+		SNIType:  "i", // default: no SNI extension present
 	}
 
 	// 1) TLS record header
@@ -174,6 +174,9 @@ func ParseClientHello(payload []byte) (*ClientHelloFields, error) {
 		// Parse extension-specific content required by your objective.
 		switch extID {
 		case 0: // server_name
+			// Spec: JA4_a marks "d" whenever the SNI extension is present,
+			// regardless of whether the advertised hostname is well formed.
+			info.SNIType = "d"
 			var nameList cryptobyte.String
 			if extContent.ReadUint16LengthPrefixed(&nameList) {
 				for !nameList.Empty() {
@@ -186,7 +189,6 @@ func ParseClientHello(payload []byte) (*ClientHelloFields, error) {
 						host := string(hostname)
 						if isLikelyHostname(host) {
 							info.SNIHost = host
-							info.SNIType = "d"
 						}
 						break
 					}

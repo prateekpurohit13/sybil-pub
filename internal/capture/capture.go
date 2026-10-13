@@ -87,7 +87,10 @@ type Source struct {
 	backend string
 	rd      *perf.Reader
 	source  *gopacket.PacketSource
-	closers []io.Closer
+	// pcapHandle is the live libpcap handle (pcap backend only); it backs
+	// Stats() so kernel receive/drop counters can be published as deltas.
+	pcapHandle *pcap.Handle
+	closers    []io.Closer
 
 	// perfPackets is fed by the reader goroutine for the eBPF backend and
 	// selected on together with ctx in NextPacket. perfStop is closed by Close
@@ -197,6 +200,32 @@ func (s *Source) LostSamples() uint64 {
 // userspace decoder (shorter than an Ethernet header, or undecodable).
 func (s *Source) MalformedSamples() uint64 {
 	return s.malformedSamples.Load()
+}
+
+// Stats holds the cumulative kernel packet counters reported by libpcap.
+type Stats struct {
+	Received  uint64
+	Dropped   uint64
+	IfDropped uint64
+}
+
+// Stats returns the live libpcap counters (packets received, dropped because
+// libpcap's kernel buffer was full, and dropped by the interface). ok is false
+// for backends without libpcap statistics. The values are cumulative for the
+// lifetime of the handle, so callers should publish deltas.
+func (s *Source) Stats() (Stats, bool) {
+	if s.pcapHandle == nil {
+		return Stats{}, false
+	}
+	stats, err := s.pcapHandle.Stats()
+	if err != nil {
+		return Stats{}, false
+	}
+	return Stats{
+		Received:  uint64(stats.PacketsReceived),
+		Dropped:   uint64(stats.PacketsDropped),
+		IfDropped: uint64(stats.PacketsIfDropped),
+	}, true
 }
 
 func (s *Source) openEBPF(cfg config.Capture) error {
@@ -392,6 +421,7 @@ func (s *Source) openPCAP(cfg config.Capture) error {
 
 	s.source = gopacket.NewPacketSource(handle, handle.LinkType())
 	s.source.NoCopy = true
+	s.pcapHandle = handle
 
 	return nil
 }

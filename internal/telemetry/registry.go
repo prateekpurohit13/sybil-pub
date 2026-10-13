@@ -1,9 +1,11 @@
 package telemetry
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -27,6 +29,33 @@ const (
 	histogramKind metricKind = "histogram"
 )
 
+const (
+	// maxSeriesPerMetric bounds the number of distinct label sets retained for
+	// a single metric. Once the cap is reached the least recently observed
+	// series is evicted and folded into an "other" overflow series, so an
+	// attacker minting unique JA4 fingerprints, ALPN values or any other
+	// label cannot grow the registry without bound. A bounded registry keeps
+	// scrape rendering predictable and prevents the OOM this used to allow.
+	maxSeriesPerMetric = 5000
+
+	// overflowLabelValue is the label value used by the per-metric overflow
+	// series (for example ja4="other"). Every value of an evicted series' label
+	// set is replaced with this value and the evicted counters are folded into
+	// the overflow series, so aggregate rates stay correct.
+	overflowLabelValue = "other"
+
+	// seriesDroppedMetric counts series evictions and observations sent to
+	// unregistered metrics. It is rendered from Registry.dropped rather than
+	// stored as ordinary series to avoid recursive locking.
+	seriesDroppedMetric = "sybil_metrics_series_dropped_total"
+	dropReasonOverflow  = "overflow"
+	dropReasonUnknown   = "unknown_metric"
+
+	// unknownMetricLogInterval throttles the "unregistered metric" warning so
+	// a buggy or hostile call path cannot flood the logs.
+	unknownMetricLogInterval = time.Minute
+)
+
 type metricDef struct {
 	help    string
 	kind    metricKind
@@ -34,16 +63,29 @@ type metricDef struct {
 }
 
 type metricSeries struct {
+	key     string
 	labels  Labels
 	value   float64
 	buckets []uint64
 	count   uint64
 	sum     float64
+
+	// lruElem is this series' element in metricState.lru. It is nil for the
+	// per-metric overflow series, which is never evicted.
+	lruElem *list.Element
 }
 
 type metricState struct {
 	def    metricDef
 	series map[string]*metricSeries
+
+	// lru orders series by last observation, most recently used first. The
+	// overflow series is intentionally not tracked here.
+	lru *list.List
+
+	// overflowKey is the series key of the per-metric overflow bucket, if one
+	// has been created. It is never evicted.
+	overflowKey string
 }
 
 type Registry struct {
@@ -51,12 +93,27 @@ type Registry struct {
 
 	mu      sync.RWMutex
 	metrics map[string]*metricState
+
+	// dropped counts evicted series and observations sent to unregistered
+	// metrics, keyed by reason. It is rendered as seriesDroppedMetric.
+	dropped map[string]uint64
+
+	// capture* remember the last cumulative libpcap counters so
+	// RecordCaptureStats can publish deltas.
+	captureReceived  uint64
+	captureDropped   uint64
+	captureIfDropped uint64
+
+	logMu         sync.Mutex
+	unknownLogged map[string]time.Time
 }
 
 func NewRegistry(backend, iface string) *Registry {
 	r := &Registry{
-		started: time.Now(),
-		metrics: make(map[string]*metricState),
+		started:       time.Now(),
+		metrics:       make(map[string]*metricState),
+		dropped:       make(map[string]uint64),
+		unknownLogged: make(map[string]time.Time),
 	}
 
 	r.registerGauge("sybil_runtime_info", "Static runtime metadata for the active Sybil process", nil)
@@ -79,6 +136,10 @@ func NewRegistry(backend, iface string) *Registry {
 	r.registerHistogram("sybil_processing_duration_seconds", "Pipeline processing durations", []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
 	r.registerCounter("sybil_redis_record_total", "Redis-backed stats store outcomes")
 	r.registerHistogram("sybil_redis_record_duration_seconds", "Redis-backed stats store durations", []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
+	r.registerCounter(seriesDroppedMetric, "Metric series and observations dropped because a metric exceeded its cardinality limit or was not registered")
+	r.registerCounter("sybil_capture_pcap_received_total", "Packets received by the libpcap backend (kernel counter)")
+	r.registerCounter("sybil_capture_pcap_dropped_total", "Packets dropped by libpcap because its kernel buffer was full")
+	r.registerCounter("sybil_capture_pcap_ifdropped_total", "Packets dropped by the interface before reaching libpcap")
 	r.registerGauge("sybil_uptime_seconds", "Process uptime in seconds", nil)
 
 	r.Set("sybil_runtime_info", Labels{
@@ -95,6 +156,9 @@ func (r *Registry) ObserveLookup(event risk.LookupEvent) {
 		"result": sanitizeLabelValue(event.Result, "unknown"),
 	}
 	r.Inc("sybil_lookup_requests_total", labels)
+	// Only events with a measured duration update the histogram; the cache
+	// write path emits a zero duration to mean "not measured", and counting
+	// those would skew lookup latency low.
 	if event.Duration > 0 {
 		r.Observe("sybil_lookup_duration_seconds", labels, event.Duration.Seconds())
 	}
@@ -140,6 +204,38 @@ func (r *Registry) RecordCaptureError(err error) {
 		kind = "closed"
 	}
 	r.Inc("sybil_capture_errors_total", Labels{"kind": kind})
+}
+
+// CaptureStats holds the cumulative kernel packet counters reported by a
+// capture source that exposes libpcap statistics.
+type CaptureStats struct {
+	Received  uint64
+	Dropped   uint64
+	IfDropped uint64
+}
+
+// RecordCaptureStats publishes libpcap kernel counters. The caller passes the
+// cumulative values from the capture source on each poll; the registry stores
+// deltas and exposes monotonic counters.
+func (r *Registry) RecordCaptureStats(stats CaptureStats) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addLocked("sybil_capture_pcap_received_total", nil, deltaUint64(&r.captureReceived, stats.Received))
+	r.addLocked("sybil_capture_pcap_dropped_total", nil, deltaUint64(&r.captureDropped, stats.Dropped))
+	r.addLocked("sybil_capture_pcap_ifdropped_total", nil, deltaUint64(&r.captureIfDropped, stats.IfDropped))
+}
+
+// deltaUint64 returns cur-last and advances last. A counter smaller than the
+// previous value (for example after the interface is reopened) resets the
+// baseline and contributes no delta.
+func deltaUint64(last *uint64, cur uint64) float64 {
+	if cur < *last {
+		*last = cur
+		return 0
+	}
+	delta := cur - *last
+	*last = cur
+	return float64(delta)
 }
 
 func (r *Registry) RecordEvent(event stream.Event) {
@@ -217,7 +313,10 @@ func (r *Registry) RecordAssessment(assessment risk.Assessment) {
 }
 
 func (r *Registry) ObserveDuration(stage string, duration time.Duration) {
-	if duration <= 0 {
+	// Negative durations indicate a clock problem and are ignored. Zero is a
+	// legitimate (sub-resolution) observation and is recorded, so the
+	// histogram count and +Inf bucket cover every completed stage.
+	if duration < 0 {
 		return
 	}
 	r.Observe("sybil_processing_duration_seconds", Labels{
@@ -284,6 +383,20 @@ func (r *Registry) render() string {
 				fmt.Fprintf(&b, "%s_count%s %d\n", name, formatLabels(series.labels), series.count)
 			}
 		}
+
+		// Dropped series and unknown-metric observations are tracked in plain
+		// counters; synthesize them here so the help/type lines above stay
+		// correct and no recursive locking is needed while recording drops.
+		if name == seriesDroppedMetric {
+			reasons := make([]string, 0, len(r.dropped))
+			for reason := range r.dropped {
+				reasons = append(reasons, reason)
+			}
+			sort.Strings(reasons)
+			for _, reason := range reasons {
+				fmt.Fprintf(&b, "%s{reason=%q} %d\n", name, reason, r.dropped[reason])
+			}
+		}
 	}
 
 	return b.String()
@@ -307,6 +420,7 @@ func (r *Registry) register(name string, def metricDef) {
 	r.metrics[name] = &metricState{
 		def:    def,
 		series: make(map[string]*metricSeries),
+		lru:    list.New(),
 	}
 }
 
@@ -316,28 +430,53 @@ func (r *Registry) Inc(name string, labels Labels) {
 
 func (r *Registry) Add(name string, labels Labels, delta float64) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	series := r.getSeriesLocked(name, labels)
-	series.value += delta
+	series, ok := r.getSeriesLocked(name, labels)
+	if ok {
+		series.value += delta
+	} else {
+		r.countDroppedLocked(dropReasonUnknown)
+	}
+	r.mu.Unlock()
+	if !ok {
+		r.logUnknownMetric(name)
+	}
 }
 
 func (r *Registry) Set(name string, labels Labels, value float64) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	series := r.getSeriesLocked(name, labels)
-	series.value = value
+	series, ok := r.getSeriesLocked(name, labels)
+	if ok {
+		series.value = value
+	} else {
+		r.countDroppedLocked(dropReasonUnknown)
+	}
+	r.mu.Unlock()
+	if !ok {
+		r.logUnknownMetric(name)
+	}
 }
 
 func (r *Registry) Observe(name string, labels Labels, value float64) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	state, ok := r.metrics[name]
-	if !ok {
+	state, known := r.metrics[name]
+	if !known {
+		r.countDroppedLocked(dropReasonUnknown)
+		r.mu.Unlock()
+		r.logUnknownMetric(name)
 		return
 	}
-	series := r.getSeriesLocked(name, labels)
+	series, ok := r.getSeriesLocked(name, labels)
+	if !ok {
+		// Unreachable while the metric exists, but keep the write path safe
+		// and loud instead of writing into a throwaway series.
+		r.countDroppedLocked(dropReasonUnknown)
+		r.mu.Unlock()
+		r.logUnknownMetric(name)
+		return
+	}
 	if state.def.kind != histogramKind {
 		series.value = value
+		r.mu.Unlock()
 		return
 	}
 	series.count++
@@ -348,25 +487,122 @@ func (r *Registry) Observe(name string, labels Labels, value float64) {
 			break
 		}
 	}
+	r.mu.Unlock()
 }
 
-func (r *Registry) getSeriesLocked(name string, labels Labels) *metricSeries {
+// getSeriesLocked returns the series for name/labels, creating it if needed.
+// It reports false for a metric that was never registered: such observations
+// are counted as dropped and logged instead of being written into a throwaway
+// series (which silently discarded the increment). Callers must hold r.mu.
+func (r *Registry) getSeriesLocked(name string, labels Labels) (*metricSeries, bool) {
 	state, ok := r.metrics[name]
 	if !ok {
-		return &metricSeries{}
+		return nil, false
 	}
 	key, normalized := canonicalLabels(labels)
-	series, ok := state.series[key]
-	if ok {
-		return series
+	if series, ok := state.series[key]; ok {
+		if series.lruElem != nil {
+			state.lru.MoveToFront(series.lruElem)
+		}
+		return series, true
 	}
-	series = &metricSeries{
-		labels: normalized,
+	if state.lru.Len() >= maxSeriesPerMetric {
+		state.evictLocked(r)
 	}
+	series := &metricSeries{key: key, labels: normalized}
 	if state.def.kind == histogramKind {
 		series.buckets = make([]uint64, len(state.def.buckets))
 	}
 	state.series[key] = series
+	series.lruElem = state.lru.PushFront(series)
+	return series, true
+}
+
+// addLocked records a delta for an already-registered metric without logging.
+// Callers must hold r.mu.
+func (r *Registry) addLocked(name string, labels Labels, delta float64) {
+	series, ok := r.getSeriesLocked(name, labels)
+	if !ok {
+		r.countDroppedLocked(dropReasonUnknown)
+		return
+	}
+	series.value += delta
+}
+
+// countDroppedLocked records a dropped observation or an evicted series.
+// Callers must hold r.mu.
+func (r *Registry) countDroppedLocked(reason string) {
+	if r.dropped == nil {
+		r.dropped = make(map[string]uint64)
+	}
+	r.dropped[reason]++
+}
+
+// logUnknownMetric warns that an observation was sent to a metric that was
+// never registered. Warnings are throttled per metric so a hot unregistered
+// label path cannot flood the logs.
+func (r *Registry) logUnknownMetric(name string) {
+	r.logMu.Lock()
+	if r.unknownLogged == nil {
+		r.unknownLogged = make(map[string]time.Time)
+	}
+	last, seen := r.unknownLogged[name]
+	now := time.Now()
+	if seen && now.Sub(last) < unknownMetricLogInterval {
+		r.logMu.Unlock()
+		return
+	}
+	r.unknownLogged[name] = now
+	r.logMu.Unlock()
+	log.Printf("telemetry: dropped observation for unregistered metric %q; register it before use", name)
+}
+
+// evictLocked removes the least recently observed series and folds it into
+// the metric's overflow series. Callers must hold r.mu.
+func (s *metricState) evictLocked(r *Registry) {
+	for s.lru.Len() > 0 {
+		elem := s.lru.Back()
+		s.lru.Remove(elem)
+		evicted := elem.Value.(*metricSeries)
+		evicted.lruElem = nil
+		if s.overflowKey != "" && evicted.key == s.overflowKey {
+			continue
+		}
+		delete(s.series, evicted.key)
+		overflow := s.overflowLocked(evicted.labels)
+		overflow.value += evicted.value
+		if s.def.kind == histogramKind {
+			overflow.count += evicted.count
+			overflow.sum += evicted.sum
+			for i := range overflow.buckets {
+				overflow.buckets[i] += evicted.buckets[i]
+			}
+		}
+		r.countDroppedLocked(dropReasonOverflow)
+		return
+	}
+}
+
+// overflowLocked returns the overflow series for the metric's label shape,
+// creating it on first use. All label values are replaced with
+// overflowLabelValue so the bucket is easy to spot in dashboards. Callers
+// must hold r.mu.
+func (s *metricState) overflowLocked(labels Labels) *metricSeries {
+	other := make(Labels, len(labels))
+	for name := range labels {
+		other[name] = overflowLabelValue
+	}
+	key, normalized := canonicalLabels(other)
+	if series, ok := s.series[key]; ok {
+		s.overflowKey = key
+		return series
+	}
+	series := &metricSeries{key: key, labels: normalized}
+	if s.def.kind == histogramKind {
+		series.buckets = make([]uint64, len(s.def.buckets))
+	}
+	s.series[key] = series
+	s.overflowKey = key
 	return series
 }
 
@@ -443,19 +679,27 @@ func sanitizeLabelValue(value, fallback string) string {
 	if value == "" {
 		return fallback
 	}
+	// Collapse runs of invalid characters to a single '_' in one pass. A
+	// single strings.ReplaceAll("__", "_") is not enough: on a run of four
+	// underscores it only halves the run ("a____b" -> "a__b"), and repeated
+	// scraping/persistence of such values could still split series.
 	var b strings.Builder
+	b.Grow(len(value))
+	lastUnderscore := false
 	for _, r := range value {
 		switch {
-		case r >= 'a' && r <= 'z':
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
+			lastUnderscore = false
 		default:
+			if lastUnderscore {
+				continue
+			}
 			b.WriteByte('_')
+			lastUnderscore = true
 		}
 	}
 	out := strings.Trim(b.String(), "_")
-	out = strings.ReplaceAll(out, "__", "_")
 	if out == "" {
 		return fallback
 	}
@@ -480,6 +724,37 @@ func normalizeVersion(version string) string {
 	return strings.ReplaceAll(version, ".", "_")
 }
 
+// knownALPNFamilies maps well-known ALPN protocol identifiers to a small,
+// bounded set of label values. Any identifier outside this set is reported as
+// "other" so a peer cannot mint unbounded sybil_tls_alpn_total series.
+var knownALPNFamilies = map[string]string{
+	"http/0.9":           "http1",
+	"grpc":               "grpc",
+	"grpc-exp":           "grpc",
+	"spdy/2":             "spdy",
+	"spdy/3":             "spdy",
+	"spdy/3.1":           "spdy",
+	"quic":               "quic",
+	"doq":                "doq",
+	"dot":                "dot",
+	"coap":               "coap",
+	"co":                 "co",
+	"mqtt":               "mqtt",
+	"stun.turn":          "stun",
+	"stun.nat-discovery": "stun",
+	"webrtc":             "webrtc",
+	"c-webrtc":           "webrtc",
+	"ftp":                "ftp",
+	"imap":               "imap",
+	"pop3":               "pop3",
+	"smtp":               "smtp",
+	"ssh":                "ssh",
+	"irc":                "irc",
+	"xmpp-client":        "xmpp",
+	"xmpp-server":        "xmpp",
+	"acme-tls/1":         "acme-tls",
+}
+
 func normalizeALPN(alpn string) string {
 	alpn = strings.TrimSpace(strings.ToLower(alpn))
 	switch {
@@ -491,9 +766,11 @@ func normalizeALPN(alpn string) string {
 		return "http1"
 	case strings.HasPrefix(alpn, "h3"):
 		return "h3"
-	default:
-		return sanitizeLabelValue(alpn, "other")
 	}
+	if family, ok := knownALPNFamilies[alpn]; ok {
+		return family
+	}
+	return "other"
 }
 
 func normalizeJA4FingerprintLabel(value string) string {

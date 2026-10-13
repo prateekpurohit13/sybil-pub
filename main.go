@@ -145,6 +145,16 @@ func main() {
 				registry.Add("sybil_capture_errors_total", telemetry.Labels{"kind": "malformed_samples"}, float64(malformed-lastMalformedSamples))
 				lastMalformedSamples = malformed
 			}
+			// libpcap keeps its own kernel counters; publish deltas so receive
+			// and drop behavior is visible on the dashboards. eBPF sources do
+			// not expose these and the call is a no-op for them.
+			if stats, ok := source.Stats(); ok {
+				registry.RecordCaptureStats(telemetry.CaptureStats{
+					Received:  stats.Received,
+					Dropped:   stats.Dropped,
+					IfDropped: stats.IfDropped,
+				})
+			}
 		default:
 			packet, err := source.NextPacket(ctx)
 			if err != nil {

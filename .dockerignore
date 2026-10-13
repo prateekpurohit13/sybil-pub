@@ -1,0 +1,18 @@
+# VCS metadata (build context only needs the Go sources)
+.git/
+.jj/
+
+# Local build output and logs
+bin/
+*.log
+
+# Secrets and local env files
+*.pem
+.env*
+
+# Frontend build artifacts (not needed to compile the Go binary)
+sybil_fe/node_modules/
+sybil_fe/.next/
+
+# Compose-only monitoring config; mounted from the host at runtime
+monitoring/

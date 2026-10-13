@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -78,6 +79,28 @@ func TestHealthHandlerReportsRedisDegraded(t *testing.T) {
 	payload = healthPayload(t, registry)
 	if payload["status"] != "ok" || payload["redis"] != "up" {
 		t.Fatalf("expected ok/up health, got %v", payload)
+	}
+}
+
+func TestStartHTTPServerBindFailureIsFatal(t *testing.T) {
+	// Occupy a port so the next bind fails. startHTTPServer must return the
+	// error (main logs it as fatal) instead of serving headless.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registry := telemetry.NewRegistry("pcap", "lo")
+	closeFn, err := startHTTPServer(ctx, config.Observability{HTTPAddr: ln.Addr().String()}, registry, nil)
+	if err == nil {
+		if closeFn != nil {
+			closeFn()
+		}
+		t.Fatal("expected bind failure for an already-used port")
 	}
 }
 

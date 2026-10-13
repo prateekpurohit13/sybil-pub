@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -639,11 +640,26 @@ func startHTTPServer(ctx context.Context, cfg config.Observability, registry *te
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", registry.Handler())
 	mux.Handle("/healthz", registry.HealthHandler())
-	api.RegisterRoutes(mux, apiStore)
+	api.RegisterRoutesWithOptions(mux, apiStore, api.Options{
+		AllowedOrigins: cfg.HTTPCORSOrigins,
+		Token:          cfg.HTTPToken,
+	})
+
+	// Bind synchronously so a taken port or bad address is fatal at startup
+	// instead of being logged from a goroutine while the process keeps
+	// running without its observability/API surface.
+	listener, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return nil, fmt.Errorf("observability server listen on %s: %w", cfg.HTTPAddr, err)
+	}
 
 	server := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: mux,
+		Addr:              cfg.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
 	go func() {
@@ -654,7 +670,7 @@ func startHTTPServer(ctx context.Context, cfg config.Observability, registry *te
 	}()
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("observability server failed: %v", err)
 		}
 	}()

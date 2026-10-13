@@ -4,12 +4,26 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
 const (
 	BackendPCAP = "pcap"
 	BackendEBPF = "ebpf"
+
+	// DefaultHTTPAddr binds the observability surface to loopback only. The
+	// /api endpoints expose source/destination IPs, JA4 fingerprints and
+	// threat history, so exposing them to the network must be an explicit
+	// operator decision (e.g. -http-addr :9090).
+	DefaultHTTPAddr = "127.0.0.1:9090"
+
+	// Default server timeouts bound how long a slow or stalled client can
+	// hold a connection (slowloris) and how long a handler may take.
+	DefaultHTTPReadHeaderTimeout = 5 * time.Second
+	DefaultHTTPReadTimeout       = 10 * time.Second
+	DefaultHTTPWriteTimeout      = 10 * time.Second
+	DefaultHTTPIdleTimeout       = 60 * time.Second
 )
 
 type Config struct {
@@ -58,6 +72,29 @@ type Risk struct {
 
 type Observability struct {
 	HTTPAddr string
+	// HTTPToken, when non-empty, requires "Authorization: Bearer <token>"
+	// on the /api endpoints so the dashboard data is not world-readable.
+	HTTPToken string
+	// HTTPCORSOrigins is the exact allowlist of browser origins permitted to
+	// read /api cross-origin. Empty means same-origin only; "*" is rejected
+	// because a wildcard would re-expose the API to any web page.
+	HTTPCORSOrigins []string
+
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+}
+
+func defaultObservability() Observability {
+	return Observability{
+		HTTPAddr:          DefaultHTTPAddr,
+		HTTPToken:         os.Getenv("SYBIL_HTTP_TOKEN"),
+		ReadHeaderTimeout: DefaultHTTPReadHeaderTimeout,
+		ReadTimeout:       DefaultHTTPReadTimeout,
+		WriteTimeout:      DefaultHTTPWriteTimeout,
+		IdleTimeout:       DefaultHTTPIdleTimeout,
+	}
 }
 
 func Parse() Config {
@@ -91,11 +128,49 @@ func Parse() Config {
 	flag.IntVar(&cfg.Risk.RateLimitThresh, "risk-rate-limit-threshold", -1, "Optional override for rate-limit threshold (default scorer config when negative)")
 	flag.IntVar(&cfg.Risk.ChallengeThresh, "risk-challenge-threshold", -1, "Optional override for challenge threshold (default scorer config when negative)")
 	flag.IntVar(&cfg.Risk.BlockThresh, "risk-block-threshold", -1, "Optional override for block threshold (default scorer config when negative)")
-	flag.StringVar(&cfg.Observability.HTTPAddr, "http-addr", ":9090", "HTTP listen address for /metrics and /healthz; empty disables the server")
+	obs := defaultObservability()
+	flag.StringVar(&obs.HTTPAddr, "http-addr", obs.HTTPAddr, "HTTP listen address for /metrics, /healthz and /api; defaults to loopback only, pass :9090 to expose on all interfaces; empty disables the server")
+	flag.StringVar(&obs.HTTPToken, "http-token", obs.HTTPToken, "Optional bearer token required on /api endpoints (default $SYBIL_HTTP_TOKEN); empty leaves /api unauthenticated")
+	flag.Func("http-cors-origins", "Comma-separated exact browser origins allowed to read /api cross-origin (default none: same-origin only; wildcard not supported)", func(raw string) error {
+		origins, err := parseCORSOrigins(raw)
+		if err != nil {
+			return err
+		}
+		obs.HTTPCORSOrigins = origins
+		return nil
+	})
+	flag.DurationVar(&obs.ReadHeaderTimeout, "http-read-header-timeout", obs.ReadHeaderTimeout, "Maximum time to read request headers")
+	flag.DurationVar(&obs.ReadTimeout, "http-read-timeout", obs.ReadTimeout, "Maximum time to read the whole request")
+	flag.DurationVar(&obs.WriteTimeout, "http-write-timeout", obs.WriteTimeout, "Maximum time to write a response")
+	flag.DurationVar(&obs.IdleTimeout, "http-idle-timeout", obs.IdleTimeout, "Maximum keep-alive idle time between requests")
 
 	flag.Parse()
 
+	cfg.Observability = obs
 	return cfg
+}
+
+// parseCORSOrigins splits and normalizes a comma-separated origin allowlist.
+// A wildcard is refused rather than silently honored: the previous behavior
+// (Access-Control-Allow-Origin: *) let any web page read the API.
+func parseCORSOrigins(raw string) ([]string, error) {
+	var origins []string
+	seen := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		origin := strings.TrimSpace(part)
+		if origin == "" {
+			continue
+		}
+		if origin == "*" {
+			return nil, fmt.Errorf("wildcard CORS origin is not supported; list explicit origins instead")
+		}
+		if _, ok := seen[origin]; ok {
+			continue
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins, nil
 }
 
 func (c Config) Validate() error {

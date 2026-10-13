@@ -116,6 +116,7 @@ func main() {
 		cancel()
 	}()
 
+	var lastLostSamples, lastMalformedSamples uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -123,6 +124,17 @@ func main() {
 		case <-ticker.C:
 			// Periodically flush old streams to trigger reassembly
 			processor.FlushOlderThan(time.Now().Add(-time.Second * 3))
+			// The eBPF backend reports dropped/malformed samples through
+			// counters instead of per-batch errors, so publish deltas here
+			// and keep a busy interface from flooding the logs.
+			if lost := source.LostSamples(); lost > lastLostSamples {
+				registry.Add("sybil_capture_errors_total", telemetry.Labels{"kind": "lost_samples"}, float64(lost-lastLostSamples))
+				lastLostSamples = lost
+			}
+			if malformed := source.MalformedSamples(); malformed > lastMalformedSamples {
+				registry.Add("sybil_capture_errors_total", telemetry.Labels{"kind": "malformed_samples"}, float64(malformed-lastMalformedSamples))
+				lastMalformedSamples = malformed
+			}
 		default:
 			packet, err := source.NextPacket(ctx)
 			if err != nil {

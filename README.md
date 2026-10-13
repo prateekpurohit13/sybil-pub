@@ -179,10 +179,10 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  Language              Files        Lines         Code     Comments       Blanks
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- C                         1           41           27            5            9
+ C                         1          116           69           29           18
  CSS                       1          126          121            0            5
  Dockerfile                1           44           23           18            3
- Go                       29         6396         5383          288          725
+ Go                       31         6929         5756          387          786
  JavaScript                2           25           20            2            3
  JSON                      7        13553        13553            0            0
  Makefile                  1           29           20            0            9
@@ -197,7 +197,7 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  |- BASH                   2           24           21            3            0
  (Total)                              239           21          147           71
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    83        31090        28846          503         1741
+ Total                    85        31698        29261          626         1811
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

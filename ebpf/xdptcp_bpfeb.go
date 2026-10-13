@@ -61,7 +61,8 @@ type XdpTcpProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type XdpTcpMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
+	Events     *ebpf.MapSpec `ebpf:"events"`
+	PortConfig *ebpf.MapSpec `ebpf:"port_config"`
 }
 
 // XdpTcpVariableSpecs contains global variables before they are loaded into the kernel.
@@ -90,12 +91,14 @@ func (o *XdpTcpObjects) Close() error {
 //
 // It can be passed to LoadXdpTcpObjects or ebpf.CollectionSpec.LoadAndAssign.
 type XdpTcpMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
+	Events     *ebpf.Map `ebpf:"events"`
+	PortConfig *ebpf.Map `ebpf:"port_config"`
 }
 
 func (m *XdpTcpMaps) Close() error {
 	return _XdpTcpClose(
 		m.Events,
+		m.PortConfig,
 	)
 }
 

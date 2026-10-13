@@ -64,26 +64,38 @@ func SummarizeFingerprint(record *FingerprintRecord, lookupErr error, lookupEnab
 		summary.IdentityClass = "verified_known"
 	}
 
-	if isBrowser(app, ua) {
+	// Identity precedence, highest first. Exactly one branch wins, so the
+	// result no longer depends on the order of independent if statements:
+	//
+	//   malware_like > automation > vpn > mobile_app >
+	//   verified_browser/browser > verified_known/known_unverified
+	//
+	// malware_like wins outright: known C2/loader fingerprints must never be
+	// softened by another signal. automation outranks browser because a
+	// curated client signature (curl, python-requests, Go-http-client, ...)
+	// is stronger evidence than a browser-like app/UA value; conversely a
+	// browser no longer becomes automation just because its name or TLS
+	// library contains a short token such as "go". vpn sits below automation
+	// (a VPN tunnel is not scripted traffic) but above plain mobile/browser.
+	// mobile_app is checked before browser to preserve the existing handling
+	// of mobile browsers/runtimes. verified_status only chooses between the
+	// browser/known variants; it never overrides a stronger signal.
+	switch {
+	case isMalwareLike(app, notes):
+		summary.IdentityClass = "malware_like"
+		summary.ReputationState = "suspicious"
+	case isAutomation(app, lib, ua):
+		summary.IdentityClass = "automation"
+	case isVPN(app, notes):
+		summary.IdentityClass = "vpn"
+	case isMobileApp(summary.DeviceClass, app, ua):
+		summary.IdentityClass = "mobile_app"
+	case isBrowser(app, ua):
 		if record.Verified {
 			summary.IdentityClass = "verified_browser"
 		} else {
 			summary.IdentityClass = "browser"
 		}
-	}
-
-	if isAutomation(app, lib, ua) {
-		summary.IdentityClass = "automation"
-	}
-	if isVPN(app, notes) {
-		summary.IdentityClass = "vpn"
-	}
-	if isMobileApp(summary.DeviceClass, app, ua) {
-		summary.IdentityClass = "mobile_app"
-	}
-	if isMalwareLike(app, notes) {
-		summary.IdentityClass = "malware_like"
-		summary.ReputationState = "suspicious"
 	}
 
 	return summary
@@ -103,9 +115,10 @@ func classifyApplicationFamily(app, ua, notes string) string {
 		return "curl"
 	case containsAny(app, "python") || containsAny(ua, "python", "requests"):
 		return "python"
-	case containsAny(app, "go", "golang") || containsAny(ua, "go-http-client"):
+	case containsWord(app, "go") || containsAny(app, "golang") || containsAny(ua, "go-http-client"):
 		return "go"
-	case containsAny(app, "java", "okhttp") || containsAny(ua, "java", "okhttp"):
+	case containsWord(app, "java") || containsAny(app, "okhttp", "jdk", "jre") ||
+		containsWord(ua, "java") || containsAny(ua, "okhttp"):
 		return "java"
 	case containsAny(app, "node") || containsAny(ua, "node", "axios"):
 		return "node"
@@ -134,9 +147,10 @@ func classifyLibraryFamily(lib, ua string) string {
 		return "nss"
 	case containsAny(lib, "rustls"):
 		return "rustls"
-	case containsAny(lib, "go") || containsAny(ua, "go-http-client"):
+	case containsWord(lib, "go") || containsAny(lib, "golang") || containsAny(ua, "go-http-client"):
 		return "go_tls"
-	case containsAny(lib, "java", "okhttp") || containsAny(ua, "okhttp"):
+	case containsWord(lib, "java") || containsAny(lib, "okhttp", "jdk", "jre") ||
+		containsWord(ua, "java") || containsAny(ua, "okhttp"):
 		return "java_tls"
 	case lib == "":
 		return "unknown"
@@ -186,10 +200,27 @@ func isBrowser(app, ua string) bool {
 		containsAny(ua, "chrome/", "firefox/", "safari/", "edg/", "opr/")
 }
 
+// isAutomation reports whether the record describes a scripted HTTP client
+// rather than a human-driven application.
+//
+// Short, ambiguous tokens are matched on word boundaries: "go" must not match
+// "Google Chrome", "golang", or "Django", and "java" must not match
+// "Javascript"/"JavaScriptCore". Distinctive client names ("curl",
+// "python", "okhttp", ...) keep substring matching so variants such as
+// "python-requests" and "libcurl" still match.
+//
+// Generic TLS stacks (OpenSSL, BoringSSL, rustls, Schannel, NSS) are
+// deliberately NOT automation evidence: browsers and scripted clients share
+// them, so a browser fingerprint linked against OpenSSL/BoringSSL/rustls must
+// stay a browser. True automation that uses those stacks is already
+// identified through its application/UA (curl, python-requests, ...).
 func isAutomation(app, lib, ua string) bool {
-	return containsAny(app, "curl", "wget", "python", "requests", "httpx", "go", "java", "okhttp", "node", "powershell", "bot") ||
-		containsAny(lib, "go", "okhttp", "python", "openssl", "rustls") ||
-		containsAny(ua, "curl/", "python", "go-http-client", "okhttp", "axios", "wget", "powershell")
+	return containsAny(app, "curl", "wget", "python", "requests", "httpx", "okhttp", "node", "golang", "powershell", "bot", "aiohttp", "scrapy", "libwww") ||
+		containsWord(app, "go", "java", "jdk", "jre") ||
+		containsAny(lib, "curl", "wget", "python", "requests", "httpx", "okhttp", "golang", "aiohttp") ||
+		containsWord(lib, "go", "java", "jdk", "jre") ||
+		containsAny(ua, "curl/", "python", "go-http-client", "okhttp", "axios", "wget", "powershell", "aiohttp", "scrapy", "libwww") ||
+		containsWord(ua, "java", "jdk", "jre")
 }
 
 func isVPN(app, notes string) bool {
@@ -213,4 +244,38 @@ func containsAny(value string, candidates ...string) bool {
 		}
 	}
 	return false
+}
+
+// containsWord reports whether value contains candidate delimited by
+// non-alphanumeric characters (or the string boundaries). Inputs are expected
+// to be lower-cased already. Unlike containsAny it prevents "go" from
+// matching "Google" and "java" from matching "Javascript".
+func containsWord(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		from := 0
+		for {
+			idx := strings.Index(value[from:], candidate)
+			if idx < 0 {
+				break
+			}
+			start := from + idx
+			end := start + len(candidate)
+			leadingOK := start == 0 || !isTokenByte(candidate[0]) || !isTokenByte(value[start-1])
+			trailingOK := end == len(value) || !isTokenByte(candidate[len(candidate)-1]) || !isTokenByte(value[end])
+			if leadingOK && trailingOK {
+				return true
+			}
+			from = start + 1
+		}
+	}
+	return false
+}
+
+// isTokenByte reports whether b can be part of an alphanumeric word token.
+// Inputs are already lower-cased, so only lower-case letters and digits count.
+func isTokenByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }

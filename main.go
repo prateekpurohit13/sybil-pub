@@ -269,6 +269,9 @@ func assessClientHello(ctx context.Context, threatScorer *risk.Scorer, event str
 		return nil, nil
 	}
 
+	// A ClientHello exposes only the SNI host, never the encrypted HTTP path,
+	// so Endpoint is intentionally left empty: the scorer falls back to
+	// host-level and then per-source-IP resource diversity.
 	assessment, err := threatScorer.Assess(ctx, risk.Observation{
 		JA4:       event.JA4.Fingerprint,
 		SourceIP:  event.NetFlow.Src().String(),
@@ -279,6 +282,8 @@ func assessClientHello(ctx context.Context, threatScorer *risk.Scorer, event str
 		return nil, err
 	}
 
+	// Advisory only: this label is printed and persisted for operators/API
+	// consumers, but nothing on the capture path enforces it.
 	fmt.Printf("Threat Score: %d/100 action=%s", assessment.Score, assessment.Action)
 	if assessment.Delay > 0 {
 		fmt.Printf(" delay=%s", assessment.Delay)

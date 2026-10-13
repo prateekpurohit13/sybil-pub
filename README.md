@@ -69,9 +69,9 @@ sudo ./bin/sybil -backend ebpf -iface wlan0
 
 When `-redis-addr` is set, Sybil keeps rolling JA4+IP state in Redis and emits a threat score with progressive actions:
 
-- `resource_diversity` (30): strongest signal; low unique endpoint diversity pushes risk up.
-- `velocity` (30): higher requests per active minute push risk up.
-- `burstiness` (25): sudden minute-level spikes push risk up.
+- `resource_diversity` (30): strongest signal; low unique destination diversity pushes risk up. A real HTTP endpoint path earns full weight, an SNI host fallback earns 75%, and a per-source-IP bucket (no SNI, or `-risk-use-host-fallback=false`) earns 50%.
+- `velocity` (30): higher requests per active minute push risk up. This is an active-minute rate: idle minutes are not zero-filled, so a slow drip and a burst compressed into the same active minutes read the same here. `burstiness` separates the two.
+- `burstiness` (25): the newest minute is compared against the median of the preceding active minutes, so a single-minute spike is scored even before three buckets exist.
 - `fingerprint_reputation` (15): JA4 DB metadata only nudges the score; it does not override behavior.
 
 Default actions:
@@ -81,7 +81,11 @@ Default actions:
 - `90+`: challenge
 - `95+`: block
 
-Important: a raw TLS ClientHello does not expose encrypted HTTP paths. In the current sniffer flow, Sybil can only see SNI at handshake time, so the diversity model falls back to host-level diversity when no real endpoint path is available. That fallback is intentionally weighted lower than true endpoint diversity.
+Important: a raw TLS ClientHello does not expose encrypted HTTP paths. In the current sniffer flow, Sybil can only see SNI at handshake time, so the diversity model falls back to host-level diversity when no real endpoint is available, and to a per-source-IP bucket when there is no SNI either. Fallbacks are never silently zero-valued.
+
+The reported score is normalized against the maximum weight the sensor can actually earn from the signals it has. `100` therefore means "as risky as the observable evidence allows", and the `70/80/90/95` thresholds stay reachable in host-only and SNI-less capture. When JA4 enrichment is disabled the denominator is behavior-only; when enrichment is enabled the reputation weight stays in the denominator even if a lookup errors, so an outage cannot inflate the score.
+
+> **Threat model / enforcement:** actions are advisory only. Sybil is a passive sniffer: it prints the action and persists it with each assessment, but it does not delay, rate-limit, challenge, or block anything. The capture path (including the eBPF/XDP backend) always passes traffic; wiring these labels into an enforcement plane (proxy, firewall, upstream XDP verdict) is left to the operator.
 
 ### JA4 Enrichment
 
@@ -178,7 +182,7 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  C                         1           41           27            5            9
  CSS                       1          126          121            0            5
  Dockerfile                1           44           23           18            3
- Go                       29         6078         5160          210          708
+ Go                       29         6396         5383          288          725
  JavaScript                2           25           20            2            3
  JSON                      7        13553        13553            0            0
  Makefile                  1           29           20            0            9
@@ -189,11 +193,11 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  TypeScript                5          257          214            4           39
  YAML                      5         8052         7466            0          586
 ─────────────────────────────────────────────────────────────────────────────────
- Markdown                  2          211            0          142           69
+ Markdown                  2          215            0          144           71
  |- BASH                   2           24           21            3            0
- (Total)                              235           21          145           69
+ (Total)                              239           21          147           71
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    83        30768        28623          423         1722
+ Total                    83        31090        28846          503         1741
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

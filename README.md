@@ -56,13 +56,14 @@ sudo ./bin/sybil -backend ebpf -iface wlan0
 -hello-out <path>       Save first detected TLS hello record bytes to file
 -exit-after-hello       Exit after first detected TLS hello
 -redis-addr <addr>      Enable Redis-backed live threat scoring
--redis-password <pwd>   Redis password
+-redis-password <pwd>   Redis password (prefer $SYBIL_REDIS_PASSWORD)
 -redis-db <n>           Redis database number (default: 0)
 -risk-key-prefix <key>  Redis prefix for scoring state
 -ja4-lookup-url <url>   Optional JA4 enrichment URL or template
--ja4-db-url <url>       Optional libSQL/Turso JA4 database URL
--ja4-db-auth-token <t>  Optional auth token for the JA4 database
+-ja4-db-url <url>       Optional libSQL/Turso JA4 database URL (prefer $DB_URL)
+-ja4-db-auth-token <t>  Optional auth token for the JA4 database (prefer $AUTH_TOKEN)
 -http-addr <addr>       HTTP listen address for /metrics and /healthz
+-http-token <token>     Bearer token for /api endpoints (prefer $SYBIL_HTTP_TOKEN)
 ```
 
 ### Live Threat Scoring
@@ -91,6 +92,7 @@ The reported score is normalized against the maximum weight the sensor can actua
 
 For demo mode, Sybil can enrich JA4 fingerprints from a read-only libSQL/Turso database.
 The binary reads `DB_URL` and `AUTH_TOKEN` from the environment by default, or you can pass `-ja4-db-url` and `-ja4-db-auth-token`.
+Prefer the environment variables on shared machines: CLI flags are visible to every local user via `ps` and `/proc/<pid>/cmdline`.
 
 When enrichment is enabled, Sybil classifies traffic into demo-friendly categories such as `verified_browser`, `automation`, `vpn`, `mobile_app`, `known_unverified`, and `unknown`.
 These labels feed the Grafana dashboards and also influence the reputation component of the threat score.
@@ -123,8 +125,8 @@ Prometheus scrapes the Sybil process from `host.docker.internal:9090`, so run th
 Start Sybil with Redis and DB enrichment:
 
 ```bash
-export DB_URL="https://thia.shrimp-fujita.ts.net"
-export AUTH_TOKEN="..."
+export DB_URL="https://<your-libsql-host>"
+export AUTH_TOKEN="<read-only-token>"
 sudo ./bin/sybil -backend pcap -iface wlan0 -redis-addr 127.0.0.1:6379
 ```
 
@@ -149,11 +151,12 @@ curl --http1.1 -I https://google.com
 curl --http1.1 -I https://www.cloudflare.com
 ```
 
-Local OpenSSL test:
+Local OpenSSL test (the generated pair is a throwaway localhost cert in the gitignored `scripts/testdata/` scratch dir; never commit it):
 
 ```bash
-openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj "/CN=localhost"
-openssl s_server -accept 8443 -cert cert.pem -key key.pem
+mkdir -p scripts/testdata
+openssl req -x509 -newkey rsa:2048 -nodes -keyout scripts/testdata/key.pem -out scripts/testdata/cert.pem -days 1 -subj "/CN=localhost"
+openssl s_server -accept 8443 -cert scripts/testdata/cert.pem -key scripts/testdata/key.pem
 ```
 
 In another terminal:
@@ -164,6 +167,17 @@ openssl s_client -connect 127.0.0.1:8443 -servername localhost
 ```
 
 When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS version, SNI, ALPN, cipher count, and extension count.
+
+## Secrets Hygiene
+
+- Pass secrets through the environment, not CLI flags: flags are visible in `ps` and `/proc/<pid>/cmdline` to every local user.
+  - `DB_URL` / `AUTH_TOKEN`: JA4 libSQL/Turso URL and read-only token. `-ja4-db-url` / `-ja4-db-auth-token` are optional overrides.
+  - `SYBIL_REDIS_PASSWORD`: Redis password. `-redis-password` still works but is ps-visible.
+  - `SYBIL_HTTP_TOKEN`: bearer token required on `/api` endpoints. `-http-token` still works but is ps-visible.
+- `.env` is gitignored; `.env.example` lists the supported variables. The binary does not parse `.env` itself, so load it in the shell: `set -a; . ./.env; set +a`.
+- `*.pem` files (including `scripts/testdata/cert.pem` and `key.pem`) are gitignored and excluded from the Docker build context by `.dockerignore`. They are throwaway local TLS test artifacts generated at runtime by the demo commands and `scripts/benchmark.sh`; never commit certificates or keys.
+- No `*_FILE` indirection is supported yet; inject these variables with your secret manager (Docker/Kubernetes secret env, systemd `EnvironmentFile`, etc.).
+- The Grafana `admin`/`admin` login, the passwordless Redis service, and the published `6379:6379` port in `docker-compose.yml` are local-dev defaults. Change the credentials and restrict the published ports before exposing the stack beyond localhost.
 
 ## References
 
@@ -191,14 +205,14 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  SVG                       5            5            5            0            0
  TSX                      16         1349         1235            2          112
  TypeScript                5          257          214            4           39
- Typst                     1          296          194           13           89
+ Typst                     1          303          197           12           94
  YAML                      5         8052         7466            0          586
 ─────────────────────────────────────────────────────────────────────────────────
- Markdown                  2          216            0          145           71
- |- BASH                   2           24           21            3            0
- (Total)                              240           21          148           71
+ Markdown                  2          229            0          156           73
+ |- BASH                   2           25           22            3            0
+ (Total)                              254           22          159           73
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    96        35517        32124         1147         2246
+ Total                    96        35538        32128         1157         2253
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

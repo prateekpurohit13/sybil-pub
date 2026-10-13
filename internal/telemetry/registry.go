@@ -63,6 +63,7 @@ func NewRegistry(backend, iface string) *Registry {
 	r.registerCounter("sybil_capture_packets_total", "Packets delivered to the stream processor")
 	r.registerCounter("sybil_capture_errors_total", "Capture read errors by kind")
 	r.registerCounter("sybil_tls_hellos_total", "Detected TLS hello messages by type")
+	r.registerCounter("sybil_tls_extract_errors_total", "TLS hello extraction failures by kind")
 	r.registerCounter("sybil_client_hello_parse_total", "ClientHello parse results")
 	r.registerCounter("sybil_ja4_build_total", "JA4 build results")
 	r.registerCounter("sybil_tls_versions_total", "Observed ClientHello TLS versions")

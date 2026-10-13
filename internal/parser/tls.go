@@ -47,64 +47,120 @@ func isGREASEValue(val uint16) bool {
 	return (val >> 8) == (val & 0xFF)
 }
 
-// ParseClientHello parses a single TLS record containing a ClientHello and
-// returns the field values required by your next stages.
+const (
+	recordHeaderLen    = 5
+	handshakeHeaderLen = 4
+)
+
+// ParseClientHello parses a TLS ClientHello from one or more consecutive
+// handshake records and returns the field values required by the next stages.
+//
+// A ClientHello that does not fit into a single TLS record is split across
+// records; the record payloads are concatenated here before the handshake
+// message is parsed. Callers that already hold the defragmented handshake
+// message can use ParseClientHelloHandshake instead.
 func ParseClientHello(payload []byte) (*ClientHelloFields, error) {
-	if len(payload) < 5 {
+	if len(payload) < recordHeaderLen {
 		return nil, errors.New("payload too short for tls record")
 	}
 
+	handshakeData, recordVersion, err := collectHandshakeRecords(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	return ParseClientHelloHandshake(handshakeData, recordVersion)
+}
+
+// collectHandshakeRecords concatenates the payloads of consecutive TLS
+// handshake records until the complete handshake message is buffered. It
+// returns the handshake message and the record-layer version of the first
+// record.
+func collectHandshakeRecords(payload []byte) ([]byte, uint16, error) {
 	input := cryptobyte.String(payload)
+	var (
+		handshake     []byte
+		recordVersion uint16
+		need          = -1
+		firstRecord   = true
+	)
+
+	for {
+		if need >= 0 && len(handshake) >= need {
+			return handshake[:need], recordVersion, nil
+		}
+		if input.Empty() {
+			return nil, 0, errors.New("clienthello length exceeds available handshake records")
+		}
+
+		var recordType uint8
+		var version uint16
+		var recordLen uint16
+		if !input.ReadUint8(&recordType) || !input.ReadUint16(&version) || !input.ReadUint16(&recordLen) {
+			return nil, 0, errors.New("incomplete tls record header")
+		}
+		if firstRecord {
+			recordVersion = version
+			firstRecord = false
+		}
+		if recordType != 0x16 {
+			return nil, 0, errors.New("packet is not a handshake record")
+		}
+
+		var recordPayload []byte
+		if !input.ReadBytes(&recordPayload, int(recordLen)) {
+			return nil, 0, errors.New("tls record length exceeds payload")
+		}
+		handshake = append(handshake, recordPayload...)
+
+		if need < 0 && len(handshake) >= handshakeHeaderLen {
+			if handshake[0] != 0x01 {
+				return nil, 0, errors.New("handshake is not a Client Hello")
+			}
+			need = handshakeHeaderLen +
+				int(handshake[1])<<16 +
+				int(handshake[2])<<8 +
+				int(handshake[3])
+		}
+	}
+}
+
+// ParseClientHelloHandshake parses a bare, already-defragmented TLS handshake
+// message (type byte 0x01 followed by the 3-byte length and body). The
+// recordVersion is copied into the returned fields; pass 0 when the record
+// layer is unknown.
+func ParseClientHelloHandshake(handshakeData []byte, recordVersion uint16) (*ClientHelloFields, error) {
+	if len(handshakeData) < handshakeHeaderLen {
+		return nil, errors.New("payload too short for tls handshake")
+	}
+
+	data := cryptobyte.String(handshakeData)
 	info := &ClientHelloFields{
-		Protocol: "t",
-		SNIType:  "i", // default: no SNI extension present
+		Protocol:      "t",
+		SNIType:       "i", // default: no SNI extension present
+		RecordVersion: recordVersion,
 	}
 
-	// 1) TLS record header
-	var recordType uint8
-	var recordVersion uint16
-	var recordLen uint16
-	if !input.ReadUint8(&recordType) || !input.ReadUint16(&recordVersion) || !input.ReadUint16(&recordLen) {
-		return nil, errors.New("incomplete tls record header")
-	}
-	info.RecordVersion = recordVersion
-
-	if recordType != 0x16 {
-		return nil, errors.New("packet is not a handshake record")
-	}
-
-	if int(recordLen) > len(payload)-5 {
-		return nil, errors.New("tls record length exceeds payload")
-	}
-
-	// Handshake bytes (inside this TLS record)
-	if len(input) < int(recordLen) {
-		return nil, errors.New("handshake payload truncated")
-	}
-	handshakeData := input[:recordLen]
-
-	// 2) Handshake header
+	// 1) Handshake header
 	var msgType uint8
-	if !handshakeData.ReadUint8(&msgType) {
+	if !data.ReadUint8(&msgType) {
 		return nil, errors.New("missing handshake type")
 	}
 	if msgType != 0x01 {
 		return nil, errors.New("handshake is not a Client Hello")
 	}
 
-	hsLen, ok := readUint24(&handshakeData)
+	hsLen, ok := readUint24(&data)
 	if !ok {
 		return nil, errors.New("missing handshake length")
 	}
-	if int(hsLen) > len(handshakeData) {
-		return nil, errors.New("clienthello length exceeds record")
+	if int(hsLen) > len(data) {
+		return nil, errors.New("clienthello length exceeds payload")
 	}
 
-	var helloBody cryptobyte.String
-	helloBody = handshakeData[:hsLen]
-	handshakeData = handshakeData[hsLen:]
+	helloBody := data[:hsLen]
 
-	// 3) Core ClientHello fields
+	// 2) Core ClientHello fields
 	var helloVersion uint16
 	if !helloBody.ReadUint16(&helloVersion) {
 		return nil, errors.New("missing version field")

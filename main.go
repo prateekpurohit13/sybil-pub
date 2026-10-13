@@ -96,7 +96,17 @@ func main() {
 			onHello(event.Hello)
 			registry.ObserveDuration("event", time.Since(eventStart))
 		},
+		OnExtractError: func(err error) {
+			kind := "parse_error"
+			if errors.Is(err, tlshello.ErrBufferLimit) {
+				kind = "buffer_limit"
+			}
+			registry.Inc("sybil_tls_extract_errors_total", telemetry.Labels{"kind": kind})
+		},
 	})
+	// Flush at shutdown so hellos still buffered in half-open streams are
+	// not dropped when capture stops.
+	defer processor.FlushAll()
 
 	source, err := capture.Open(cfg.Capture)
 	if err != nil {

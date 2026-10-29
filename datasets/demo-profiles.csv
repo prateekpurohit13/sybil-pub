@@ -9,3 +9,5 @@ curl 8.x (OpenSSL),OpenSSL,,,t13d3013h2_1d37bd780c83_8537cf56674e,,,,,,demo TLS 
 OpenSSL 3.6 s_client,OpenSSL,,,t13d0312h1_55b375c5d22e_199193a2bd39,,,,,,demo TLS library
 Mozilla Firefox,NSS,,,t13d1714h1_5b57614c22b0_b6469b2faef8,,,,,,observed host Firefox
 Mozilla Firefox,NSS,,,t13d1713h1_5b57614c22b0_6a3d802a7139,,,,,,observed host Firefox
+Chrome 155 (background),Chromium,,,t13d1517h2_8daaf6152771_e6dcd7ae0a9e,,,,,,observed background Chrome
+Chrome 155 (background),Chromium,,,t13d1518h2_8daaf6152771_e7cacf613b58,,,,,,observed background Chrome

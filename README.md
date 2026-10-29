@@ -265,7 +265,14 @@ bash scripts/demo-suspicious.sh
 
 The burst uses a 10-second quiet baseline at 1 handshake/s, then 20 handshakes/s
 for 5 seconds (100 burst attempts). The baseline gives the burstiness signal
-something to compare against. Point it at a lab-owned HTTPS target instead:
+something to compare against.
+
+`make demo` captures all TCP/443 traffic on the interface, so background browser
+or telemetry traffic can also appear. Use a loopback lab target or close other
+browsers for a clean run. Known background Chrome/Firefox variants observed in
+this lab are mapped in `datasets/demo-profiles.csv`.
+
+Point it at a lab-owned HTTPS target instead:
 
 ```bash
 bash scripts/demo-suspicious.sh --targets https://localhost:8443/

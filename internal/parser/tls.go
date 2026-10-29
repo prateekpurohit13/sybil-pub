@@ -183,10 +183,11 @@ func ParseClientHello(payload []byte) (*ClientHelloFields, error) {
 						break
 					}
 					if nameKind == 0 && len(hostname) > 0 {
-						host := string(hostname)
-						if isLikelyHostname(host) {
+						// JA4 only records whether the SNI extension is
+						// present, even when the host is an IP literal.
+						info.SNIType = "d"
+						if host := string(hostname); isLikelyHostname(host) {
 							info.SNIHost = host
-							info.SNIType = "d"
 						}
 						break
 					}

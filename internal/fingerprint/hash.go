@@ -34,7 +34,10 @@ func BuildJA4(fields *parser.ClientHelloFields) (JA4, error) {
 	ciphers := copySlice(fields.CipherSuites)
 	sort.Slice(ciphers, func(i, j int) bool { return ciphers[i] < ciphers[j] })
 	blobB := buildHexBlob(ciphers)
-	b := hash12(blobB)
+	b := emptyHash
+	if blobB != "" {
+		b = hash12(blobB)
+	}
 
 	ext := make([]uint16, 0, len(fields.Extensions))
 	for _, e := range fields.Extensions {
@@ -52,11 +55,12 @@ func BuildJA4(fields *parser.ClientHelloFields) (JA4, error) {
 	sigBlob := buildHexBlob(sigs)
 	blobC := extBlob
 	if extBlob != "" && sigBlob != "" {
-		blobC = extBlob + "," + sigBlob
-	} else if sigBlob != "" {
-		blobC = sigBlob
+		blobC = extBlob + "_" + sigBlob
 	}
-	c := hash12(blobC)
+	c := emptyHash
+	if extBlob != "" {
+		c = hash12(blobC)
+	}
 
 	return JA4{
 		A:           a,
@@ -74,14 +78,6 @@ func buildA(fields *parser.ClientHelloFields) string {
 		proto = "t"
 	}
 
-	version := "00"
-	switch fields.TLSVersion {
-	case 0x0303:
-		version = "12"
-	case 0x0304:
-		version = "13"
-	}
-
 	sniType := fields.SNIType
 	if sniType != "d" {
 		sniType = "i"
@@ -89,18 +85,70 @@ func buildA(fields *parser.ClientHelloFields) string {
 
 	alpn := normalizeALPN(fields.FirstALPN)
 
-	return fmt.Sprintf("%s%s%s%02d%02d%s", proto, version, sniType, fields.CipherCount, fields.ExtensionCount, alpn)
+	return fmt.Sprintf("%s%s%s%02d%02d%s", proto, tlsVersionTag(fields.TLSVersion), sniType,
+		clampCount(fields.CipherCount), clampCount(fields.ExtensionCount), alpn)
 }
 
-func normalizeALPN(s string) string {
-	if s == "" {
+const emptyHash = "000000000000"
+
+func tlsVersionTag(version uint16) string {
+	switch version {
+	case 0x0304:
+		return "13"
+	case 0x0303:
+		return "12"
+	case 0x0302:
+		return "11"
+	case 0x0301:
+		return "10"
+	case 0x0300:
+		return "s3"
+	case 0x0002:
+		return "s2"
+	case 0xfeff:
+		return "d1"
+	case 0xfefd:
+		return "d2"
+	case 0xfefc:
+		return "d3"
+	default:
 		return "00"
 	}
-	v := strings.ToLower(s)
-	if len(v) >= 2 {
-		return v[:2]
+}
+
+func clampCount(count int) int {
+	if count < 0 {
+		return 0
 	}
-	return v + "0"
+	if count > 99 {
+		return 99
+	}
+	return count
+}
+
+// normalizeALPN returns the first and last character of the first ALPN value.
+// Non-alphanumeric edges use the first and last character of the hex encoding,
+// matching the FoxIO JA4 specification.
+func normalizeALPN(alpn string) string {
+	if alpn == "" {
+		return "00"
+	}
+
+	raw := []byte(alpn)
+	first := raw[0]
+	last := raw[len(raw)-1]
+	if isASCIIAlnum(first) && isASCIIAlnum(last) {
+		return strings.ToLower(string([]byte{first, last}))
+	}
+
+	encoded := hex.EncodeToString(raw)
+	return string([]byte{encoded[0], encoded[len(encoded)-1]})
+}
+
+func isASCIIAlnum(value byte) bool {
+	return (value >= '0' && value <= '9') ||
+		(value >= 'A' && value <= 'Z') ||
+		(value >= 'a' && value <= 'z')
 }
 
 func buildHexBlob(values []uint16) string {

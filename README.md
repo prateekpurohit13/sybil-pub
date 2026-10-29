@@ -62,6 +62,8 @@ sudo ./bin/sybil -backend ebpf -iface wlan0
 -redis-db <n>           Redis database number (default: 0)
 -risk-key-prefix <key>  Redis prefix for scoring state
 -ja4-csv <path>         JA4+ mapping CSV for enrichment (takes precedence)
+-risk-demo              Fast demo scoring: 5s buckets, 2m window, lower thresholds
+-risk-bucket-seconds <n> Scoring bucket width override (demo preset: 5)
 -ja4-lookup-url <url>   Optional JA4 enrichment URL or template
 -ja4-db-url <url>       Optional libSQL/Turso JA4 database URL
 -ja4-db-auth-token <t>  Optional auth token for the JA4 database
@@ -197,25 +199,46 @@ Open `http://localhost:3001`. The API endpoints require Sybil to be started with
 
 ### Demo Flow
 
-Start Sybil with Redis and DB enrichment:
+Start Sybil with Redis, the bundled dataset and the fast demo scorer:
 
 ```bash
-export DB_URL="https://thia.shrimp-fujita.ts.net"
-export AUTH_TOKEN="..."
-sudo ./bin/sybil -backend pcap -iface wlan0 -redis-addr 127.0.0.1:6379
+sudo ./bin/sybil -backend pcap -iface lo -port 9443 \
+  -redis-addr 127.0.0.1:6379 \
+  -ja4-csv datasets/ja4plus-mapping.csv \
+  -risk-demo -risk-key-prefix sybil:demo
 ```
 
-Generate baseline traffic:
+`-risk-demo` uses 5-second buckets, a 2-minute window and demo thresholds
+(`30/45/60/75`) so the dashboard reacts within seconds. Production defaults are
+unchanged; do not use demo thresholds for real triage.
+
+Generate a benign profile (many SNIs, low rate):
 
 ```bash
 bash scripts/demo-benign.sh
 ```
 
-Generate bursty suspicious traffic:
+Generate a fast burst profile (one SNI, high rate):
 
 ```bash
-bash scripts/demo-suspicious.sh https://example.com 60 12
+bash scripts/demo-suspicious.sh
 ```
+
+Profiles can also be selected directly:
+
+```bash
+python3 scripts/demo_local_target_and_load.py --profile moderate
+python3 scripts/demo_local_target_and_load.py --profile flood
+```
+
+Reset demo state between presentations:
+
+```bash
+bash scripts/demo_reset.sh sybil:demo
+```
+
+The frontend refreshes every 2 seconds and Grafana every 2 seconds. Override
+the frontend interval with `NEXT_PUBLIC_REFRESH_MS=1000`.
 
 ### Example Test Commands
 
@@ -257,19 +280,24 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  Language              Files        Lines         Code     Comments       Blanks
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  C                         1           41           27            5            9
+ CSS                       1          126          121            0            5
  Dockerfile                1           27           19            5            3
- Go                       34         7132         6120          151          861
- JSON                      3         1284         1284            0            0
- Makefile                  1           40           30            0           10
- Python                    5          671          532           15          124
- Shell                     3           80           58           10           12
- YAML                      4           66           60            0            6
+ Go                       34         7209         6195          151          863
+ JavaScript                2           25           20            2            3
+ JSON                      6         1378         1378            0            0
+ Makefile                  1           48           37            0           11
+ Python                    5          711          566           14          131
+ Shell                     4           77           52           14           11
+ SVG                       5            5            5            0            0
+ TSX                      15         1331         1221            2          108
+ TypeScript                4           69           60            0            9
+ YAML                      6         8315         7688            0          627
 ─────────────────────────────────────────────────────────────────────────────────
- Markdown                  2          325            0          225          100
- |- BASH                   2           35           35            0            0
- (Total)                              360           35          225          100
+ Markdown                  3          384            0          263          121
+ |- BASH                   3           49           49            0            0
+ (Total)                              433           49          263          121
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    54         9701         8165          411         1125
+ Total                    88        19795        17438          456         1901
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

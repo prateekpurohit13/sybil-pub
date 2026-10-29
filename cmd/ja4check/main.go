@@ -118,18 +118,19 @@ func parseFlags() options {
 	var opts options
 	var inputs stringList
 
-	flag.StringVar(&opts.datasetPath, "dataset", "datasets/ja4plus-mapping.csv", "JA4+ mapping CSV")
-	flag.StringVar(&opts.dbPath, "db", "", "libSQL/SQLite database with a fingerprints table (overrides -dataset)")
-	flag.StringVar(&opts.dbAuthToken, "db-auth-token", "", "Auth token for a remote libSQL database")
-	flag.StringVar(&opts.pcapPath, "pcap", "", "Optional pcap/pcapng file to analyze")
-	flag.BoolVar(&opts.lenient, "lenient", false, "Skip invalid JA4 rows in the CSV instead of failing")
-	flag.IntVar(&opts.maxMatches, "max-matches", 20, "Maximum matches reported per fingerprint; 0 disables the cap")
-	flag.Var(&inputs, "ja4", "JA4 fingerprint to compare (repeatable)")
-	flag.StringVar(&opts.ja4File, "ja4-file", "", "File containing one JA4 fingerprint per line")
-	flag.BoolVar(&opts.jsonOutput, "json", false, "Emit JSON instead of a table")
-	flag.BoolVar(&opts.strict, "strict", false, "Exit non-zero when a fingerprint has no exact match")
-	flag.UintVar(&opts.port, "port", 0, "Only inspect TCP traffic where either port matches")
-	flag.Parse()
+	flags := flag.NewFlagSet("ja4check", flag.ExitOnError)
+	flags.StringVar(&opts.datasetPath, "dataset", "datasets/ja4plus-mapping.csv", "JA4+ mapping CSV")
+	flags.StringVar(&opts.dbPath, "db", "", "libSQL/SQLite database with a fingerprints table (overrides -dataset)")
+	flags.StringVar(&opts.dbAuthToken, "db-auth-token", "", "Auth token for a remote libSQL database")
+	flags.StringVar(&opts.pcapPath, "pcap", "", "Optional pcap/pcapng file to analyze")
+	flags.BoolVar(&opts.lenient, "lenient", false, "Skip invalid JA4 rows in the CSV instead of failing")
+	flags.IntVar(&opts.maxMatches, "max-matches", 20, "Maximum matches reported per fingerprint; 0 disables the cap")
+	flags.Var(&inputs, "ja4", "JA4 fingerprint to compare (repeatable)")
+	flags.StringVar(&opts.ja4File, "ja4-file", "", "File containing one JA4 fingerprint per line")
+	flags.BoolVar(&opts.jsonOutput, "json", false, "Emit JSON instead of a table")
+	flags.BoolVar(&opts.strict, "strict", false, "Exit non-zero when a fingerprint has no exact match")
+	flags.UintVar(&opts.port, "port", 0, "Only inspect TCP traffic where either port matches")
+	_ = flags.Parse(os.Args[1:])
 
 	opts.ja4Inputs = inputs
 	return opts

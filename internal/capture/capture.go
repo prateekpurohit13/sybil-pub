@@ -19,6 +19,18 @@ import (
 
 var ErrClosed = errors.New("capture source closed")
 
+const backendPCAPFile = "pcap-file"
+
+// OpenOffline reads packets from a pcap/pcapng file using libpcap.
+func OpenOffline(path string, matchPort uint) (*Source, error) {
+	src := &Source{backend: backendPCAPFile}
+	if err := src.openPCAPFile(path, matchPort); err != nil {
+		_ = src.Close()
+		return nil, err
+	}
+	return src, nil
+}
+
 type Source struct {
 	backend string
 	rd      *perf.Reader
@@ -50,7 +62,7 @@ func (s *Source) NextPacket(ctx context.Context) (gopacket.Packet, error) {
 	switch s.backend {
 	case config.BackendEBPF:
 		return s.readEBPFPacket()
-	case config.BackendPCAP:
+	case config.BackendPCAP, backendPCAPFile:
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -116,14 +128,26 @@ func (s *Source) openPCAP(cfg config.Capture) error {
 	if err != nil {
 		return fmt.Errorf("open pcap on %s: %w", cfg.Interface, err)
 	}
+	return s.usePCAPHandle(handle, cfg.MatchPort)
+}
+
+func (s *Source) openPCAPFile(path string, matchPort uint) error {
+	handle, err := pcap.OpenOffline(path)
+	if err != nil {
+		return fmt.Errorf("open pcap file %s: %w", path, err)
+	}
+	return s.usePCAPHandle(handle, matchPort)
+}
+
+func (s *Source) usePCAPHandle(handle *pcap.Handle, matchPort uint) error {
 	s.closers = append(s.closers, closeFunc(func() error {
 		handle.Close()
 		return nil
 	}))
 
 	filter := "tcp"
-	if cfg.MatchPort != 0 {
-		filter = fmt.Sprintf("tcp and port %d", cfg.MatchPort)
+	if matchPort != 0 {
+		filter = fmt.Sprintf("tcp and port %d", matchPort)
 	}
 	if err := handle.SetBPFFilter(filter); err != nil {
 		return fmt.Errorf("set pcap filter %q: %w", filter, err)

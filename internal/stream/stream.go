@@ -85,6 +85,12 @@ func (p *Processor) FlushOlderThan(t time.Time) {
 	p.assembler.FlushOlderThan(t)
 }
 
+// FlushAll drains every pending stream. It is intended for offline pcap
+// processing, where no more packets will arrive.
+func (p *Processor) FlushAll() {
+	p.assembler.FlushAll()
+}
+
 type tlsStreamFactory struct {
 	onEvent Handler
 }

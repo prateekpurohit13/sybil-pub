@@ -1,7 +1,8 @@
-.PHONY: build test setup generate run run-pcap verify-ja4 clean
+.PHONY: build test setup generate run run-pcap verify-ja4 ja4-db clean
 
 IFACE ?= wlan0
 PCAP ?=
+DB ?=
 
 generate:
 	go generate ./ebpf
@@ -10,6 +11,7 @@ build: generate
 	mkdir -p bin
 	go build -o bin/sybil .
 	go build -o bin/ja4check ./cmd/ja4check
+	go build -o bin/ja4import ./cmd/ja4import
 
 run: build
 	sudo ./bin/sybil -iface $(IFACE)
@@ -23,7 +25,12 @@ test:
 verify-ja4:
 	mkdir -p bin
 	go build -o bin/ja4check ./cmd/ja4check
-	./bin/ja4check -dataset datasets/ja4plus-mapping.csv $(if $(PCAP),-pcap $(PCAP),) -strict
+	./bin/ja4check $(if $(DB),-db $(DB),-dataset datasets/ja4plus-mapping.csv) $(if $(PCAP),-pcap $(PCAP),) -strict
+
+ja4-db:
+	mkdir -p bin
+	go build -o bin/ja4import ./cmd/ja4import
+	./bin/ja4import -dataset datasets/ja4plus-mapping.csv -db $(if $(DB),$(DB),file:datasets/ja4.db) -replace
 
 setup:
 	git config core.hooksPath .githooks

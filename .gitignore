@@ -26,6 +26,13 @@ go.work.sum
 # env file
 .env
 
+# Locally downloaded JA4 datasets and databases
+datasets/pcap/
+datasets/all_records.csv
+datasets/ja4db-*.csv
+datasets/*.db
+datasets/*.db-*
+
 # Editor/IDE
 .idea/
 .vscode/

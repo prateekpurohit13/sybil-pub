@@ -21,6 +21,7 @@ Binary paths:
 ```text
 ./bin/sybil       live capture, scoring, metrics, API
 ./bin/ja4check    offline pcap/dataset comparison
+./bin/ja4import   CSV to libSQL/SQLite importer
 ```
 
 ### Capture Backends
@@ -127,6 +128,30 @@ Or through Make:
 make verify-ja4 PCAP=capture.pcap
 ```
 
+Additional options:
+
+```text
+-db <dsn>             Read a libSQL/SQLite fingerprints table instead of CSV
+-db-auth-token <t>    Auth token for a remote libSQL database
+-lenient              Skip invalid JA4 rows in community CSV exports
+-max-matches <n>      Cap reported matches per fingerprint (default 20)
+```
+
+Sybil uses the libSQL driver, which reads local SQLite files and remote Turso
+databases. Import the committed CSV into a local database:
+
+```bash
+./bin/ja4import -dataset datasets/ja4plus-mapping.csv \
+  -db file:datasets/ja4.db -replace
+./bin/ja4check -db file:datasets/ja4.db -ja4 t13d1516h2_8daaf6152771_02713d6af862
+make ja4-db DB=file:datasets/ja4.db
+```
+
+The loader also accepts JA4DB-style headers (`ja4_fingerprint`, ...) and the
+frozen JA4DB export, which needs `-lenient`. Free pcap and mapping sources are
+listed in `datasets/README.md`; `scripts/fetch-ja4-samples.sh` downloads a
+small FoxIO pcap set.
+
 The CSV contains fingerprint labels, not packet payloads. Wire-level validation
 therefore requires a pcap; the CSV alone cannot prove that a ClientHello was
 parsed correctly.
@@ -217,18 +242,18 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  C                         1           41           27            5            9
  Dockerfile                1           27           19            5            3
- Go                       33         6579         5628          141          810
+ Go                       34         7131         6119          151          861
  JSON                      3         1284         1284            0            0
- Makefile                  1           33           24            0            9
+ Makefile                  1           40           30            0           10
  Python                    5          671          532           15          124
- Shell                     2           31           25            2            4
+ Shell                     3           80           58           10           12
  YAML                      4           66           60            0            6
 ─────────────────────────────────────────────────────────────────────────────────
- Markdown                  2          231            0          157           74
- |- BASH                   2           28           25            2            1
- (Total)                              259           25          159           75
+ Markdown                  2          325            0          225          100
+ |- BASH                   2           35           35            0            0
+ (Total)                              360           35          225          100
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    52         8991         7624          327         1040
+ Total                    54         9700         8164          411         1125
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

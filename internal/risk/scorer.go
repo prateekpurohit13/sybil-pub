@@ -30,8 +30,14 @@ func (f LookupFunc) Lookup(ctx context.Context, ja4 string) (*FingerprintRecord,
 }
 
 type Config struct {
-	MinuteWindow       time.Duration
-	ResourceWindow     time.Duration
+	// MinuteWindow is the lookback/retention window for the per-minute bucket
+	// series, despite the name (default 1h). Each bucket still aggregates one
+	// wall-clock minute; the window only decides how many buckets are kept.
+	MinuteWindow time.Duration
+	// ResourceWindow bounds how long a resource value counts as fresh.
+	ResourceWindow time.Duration
+	// HourWindow is the retention for the hourly rollup. HourCounts is
+	// currently informational only; scoring consumes the minute series.
 	HourWindow         time.Duration
 	BucketSeconds      int
 	BurstMinBuckets    int
@@ -55,7 +61,7 @@ func DefaultConfig() Config {
 		ResourceWindow:     time.Hour,
 		HourWindow:         24 * time.Hour,
 		BucketSeconds:      60,
-		BurstMinBuckets:    3,
+		BurstMinBuckets:    1,
 		BurstMinRequests:   10,
 		UseHostFallback:    true,
 		WeightEndpoint:     30,
@@ -79,7 +85,7 @@ func DemoConfig() Config {
 	cfg.ResourceWindow = 10 * time.Minute
 	cfg.HourWindow = time.Hour
 	cfg.BucketSeconds = 5
-	cfg.BurstMinBuckets = 2
+	cfg.BurstMinBuckets = 1
 	cfg.BurstMinRequests = 5
 	cfg.DelayThreshold = 30
 	cfg.RateLimitThreshold = 45
@@ -120,15 +126,25 @@ type FingerprintRecord struct {
 }
 
 type LiveStats struct {
-	PairKey           string
-	ResourceKind      string
-	WindowRequests    int64
-	TotalRequests     int64
-	ActiveBuckets     int
-	BucketSeconds     int
+	PairKey        string
+	ResourceKind   string
+	WindowRequests int64
+	TotalRequests  int64
+	ActiveBuckets  int
+	BucketSeconds  int
+	// ActiveMinutes is retained for compatibility with the minute-oriented
+	// scorer helpers. In the fast demo path the buckets are shorter than a
+	// minute; use ActiveBuckets/BucketSeconds for display.
+	ActiveMinutes int
+	// RequestsPerMinute is requests / active minutes, i.e. intensity while the
+	// client was active. The store never zero-fills idle minutes, so a slow
+	// drip that is only active in a few minutes of the hour reads the same as
+	// a sustained burst compressed into those minutes. Burstiness (newest
+	// minute vs trailing baseline) separates the two; see scoreBurstiness.
 	RequestsPerMinute float64
 	UniqueResources   int
 	MinuteCounts      []int64
+	// HourCounts is populated by the store but not consumed by scoring yet.
 	HourCounts        []int64
 	PeakMinuteCount   int64
 	MedianMinuteCount float64
@@ -144,6 +160,11 @@ type ScoreComponent struct {
 	Detail string
 }
 
+// Action is the advisory mitigation label attached to an assessment. Sybil is
+// a passive sniffer: it prints and persists this label, but nothing on the
+// capture path enforces it (the eBPF/XDP path always passes packets). Wiring
+// actions into a proxy, firewall, or XDP verdict is explicitly left to the
+// operator; do not read "block" as an enforced drop.
 type Action string
 
 const (
@@ -205,7 +226,12 @@ func (s *Scorer) Assess(ctx context.Context, obs Observation) (Assessment, error
 	if s.lookup != nil {
 		record, lookupErr = s.lookup.Lookup(ctx, obs.JA4)
 		if record != nil && record.JA4Fingerprint == "" {
-			record.JA4Fingerprint = obs.JA4
+			// Copy before stamping. With the worker pool, several goroutines can
+			// hold the same record (single-flight joiners or a cached pointer),
+			// so mutating the lookup result in place would be a data race.
+			stamped := *record
+			stamped.JA4Fingerprint = obs.JA4
+			record = &stamped
 		}
 	}
 	summary := SummarizeFingerprint(record, lookupErr, s.lookup != nil)
@@ -217,11 +243,21 @@ func (s *Scorer) Assess(ctx context.Context, obs Observation) (Assessment, error
 		scoreReputation(summary, record, lookupErr, s.lookup != nil, s.config),
 	}
 
-	total := 0
+	raw := 0
 	for _, component := range components {
-		total += component.Score
+		raw += component.Score
 	}
-	total = clampInt(total, 0, 100)
+	raw = clampInt(raw, 0, 100)
+
+	// Renormalize against the maximum score the visible signal set can earn.
+	// Host-only SNI and per-source-IP fallbacks earn less of the endpoint
+	// weight, so without this the documented thresholds (and therefore
+	// rate_limit/challenge/block) would be unreachable in the sniffer flow.
+	// 100 means "as risky as observable evidence allows".
+	total := raw
+	if achievable := achievableMax(stats.ResourceKind, s.lookup != nil, s.config); achievable > 0 {
+		total = clampInt(int(math.Round(float64(raw)*100.0/achievable)), 0, 100)
+	}
 
 	action, delay := deriveAction(total, s.config)
 	assessment := Assessment{
@@ -252,10 +288,14 @@ func scoreResourceDiversity(stats LiveStats, cfg Config) ScoreComponent {
 		return component
 	}
 
-	maxWeight := cfg.WeightEndpoint
-	if stats.ResourceKind == "host" {
-		maxWeight = int(math.Round(float64(maxWeight) * 0.5))
-	}
+	// Keep the declared weight (30) for every resource kind and attenuate the
+	// earnable risk by visibility confidence. Host fallback used to halve both
+	// the cap (to 15) and the reported weight, which combined with the raw
+	// sum put every action above "delay" permanently out of reach in the
+	// sniffer flow. Confidence-based attenuation keeps host/SNI evidence
+	// weaker than a real endpoint path without making it a dead letter.
+	confidence := resourceConfidence(stats.ResourceKind)
+	maxWeight := float64(cfg.WeightEndpoint) * confidence
 
 	uniqueFactor := 1.0 - clampFloat((float64(stats.UniqueResources)-1.0)/9.0, 0, 1)
 	coverage := float64(stats.UniqueResources) / float64(stats.WindowRequests)
@@ -263,10 +303,9 @@ func scoreResourceDiversity(stats LiveStats, cfg Config) ScoreComponent {
 	signalStrength := clampFloat(float64(stats.WindowRequests)/20.0, 0.35, 1)
 	risk := (0.7 * uniqueFactor) + (0.3 * coverageFactor)
 
-	component.Score = clampInt(int(math.Round(float64(maxWeight)*signalStrength*risk)), 0, maxWeight)
-	component.Weight = maxWeight
-	component.Detail = fmt.Sprintf("%d unique %s values across %d requests in %d active %ds bucket(s)",
-		stats.UniqueResources, stats.ResourceKind, stats.WindowRequests, stats.ActiveBuckets, stats.BucketSeconds)
+	component.Score = clampInt(int(math.Round(maxWeight*signalStrength*risk)), 0, cfg.WeightEndpoint)
+	component.Detail = fmt.Sprintf("%d unique %s values across %d requests in %d active %ds bucket(s) (visibility confidence %.2f)",
+		stats.UniqueResources, stats.ResourceKind, stats.WindowRequests, stats.ActiveBuckets, stats.BucketSeconds, confidence)
 	return component
 }
 
@@ -299,6 +338,15 @@ func scoreVelocity(stats LiveStats, cfg Config) ScoreComponent {
 	return component
 }
 
+const (
+	// burstMinRequests filters sampling noise: below this there is not enough
+	// traffic for a minute-level spike to be meaningful.
+	burstMinRequests = 10
+	// burstBaselineBuckets is how many preceding active minutes form the
+	// trailing baseline the newest minute is compared against.
+	burstBaselineBuckets = 5
+)
+
 func scoreBurstiness(stats LiveStats, cfg Config) ScoreComponent {
 	component := ScoreComponent{
 		Name:   "burstiness",
@@ -306,23 +354,38 @@ func scoreBurstiness(stats LiveStats, cfg Config) ScoreComponent {
 		Detail: "not enough minute buckets to measure bursts",
 	}
 
+	buckets := len(stats.MinuteCounts)
 	minBuckets := cfg.BurstMinBuckets
 	if minBuckets <= 0 {
-		minBuckets = 3
+		minBuckets = 1
 	}
 	minRequests := cfg.BurstMinRequests
 	if minRequests <= 0 {
-		minRequests = 10
+		minRequests = burstMinRequests
 	}
-	if len(stats.MinuteCounts) < minBuckets || stats.WindowRequests < minRequests {
+	if buckets < minBuckets || stats.WindowRequests < minRequests {
 		return component
 	}
 
-	median := stats.MedianMinuteCount
-	if median < 1 {
-		median = 1
+	// The newest bucket is the minute that contains this observation (the
+	// store sorted buckets ascending and just incremented the current one).
+	// Compare it against the median of the preceding active minutes instead of
+	// requiring three buckets: a single-minute spike was previously scored 0,
+	// which made burstiness silently unenforced for short demo/attack bursts.
+	current := stats.MinuteCounts[buckets-1]
+	start := buckets - 1 - burstBaselineBuckets
+	if start < 0 {
+		start = 0
 	}
-	spikeRatio := float64(stats.PeakMinuteCount) / median
+	baseline := median(stats.MinuteCounts[start : buckets-1])
+	if baseline < 1 {
+		// First observed minute (or all-zero neighbours): floor the baseline
+		// at one request/minute so a solo hot minute is a spike rather than
+		// an undefined ratio.
+		baseline = 1
+	}
+
+	spikeRatio := float64(current) / baseline
 	mean, stdev := meanAndStdDev(stats.MinuteCounts)
 	cv := 0.0
 	if mean > 0 {
@@ -331,10 +394,17 @@ func scoreBurstiness(stats LiveStats, cfg Config) ScoreComponent {
 
 	spikeFactor := clampFloat(math.Log2(math.Max(spikeRatio, 1))/5, 0, 1)
 	cvFactor := clampFloat(cv/2.5, 0, 1)
-	confidence := clampFloat(float64(len(stats.MinuteCounts))/5, 0.4, 1)
+	// A solo bucket is a fully observed concentration (all window traffic in
+	// one minute), so it gets full confidence. Ramp 2-4 buckets from 0.625 to
+	// 0.875 instead of collapsing to the old 0.4 floor that buried short
+	// bursts below the action bands.
+	confidence := 1.0
+	if buckets > 1 && buckets < 5 {
+		confidence = 0.5 + 0.125*float64(buckets-1)
+	}
 
 	component.Score = clampInt(int(math.Round(float64(cfg.WeightBurstiness)*confidence*((0.65*spikeFactor)+(0.35*cvFactor)))), 0, cfg.WeightBurstiness)
-	component.Detail = fmt.Sprintf("peak/median %.2fx over %d minute buckets", spikeRatio, len(stats.MinuteCounts))
+	component.Detail = fmt.Sprintf("current minute %d vs trailing median %.1f (%.2fx) across %d minute bucket(s)", current, baseline, spikeRatio, buckets)
 	return component
 }
 
@@ -479,16 +549,74 @@ func (c *HTTPLookupClient) Lookup(ctx context.Context, ja4 string) (*Fingerprint
 	return &record, nil
 }
 
+const (
+	resourceKindEndpoint = "endpoint"
+	resourceKindHost     = "host"
+	// resourceKindSourceIP is the last-resort destination bucket used when
+	// neither an HTTP path nor an SNI host is visible (or host fallback is
+	// disabled).
+	resourceKindSourceIP = "source_ip"
+)
+
+// Visibility confidence applied to resource observations. A real endpoint
+// path is full-strength. SNI is destination-level, not path-level evidence,
+// so it earns 75% of the diversity weight; a per-source-IP bucket says only
+// "one opaque destination", so it earns 50%.
+const (
+	hostFallbackConfidence     = 0.75
+	sourceIPFallbackConfidence = 0.50
+)
+
+// resolveResource picks the strongest destination resource visible to the
+// sensor: endpoint path > SNI host (when allowed) > per-source-IP bucket. The
+// final fallback deliberately returns a synthetic, non-empty resource so
+// diversity reads "one opaque destination" instead of silently scoring zero
+// (a missing resource used to skip the resource hash entirely and cap
+// SNI-less traffic below the rate_limit band).
 func resolveResource(obs Observation, useHostFallback bool) (string, string) {
 	if endpoint := strings.TrimSpace(obs.Endpoint); endpoint != "" {
-		return endpoint, "endpoint"
+		return endpoint, resourceKindEndpoint
 	}
 	if useHostFallback {
 		if host := strings.TrimSpace(obs.Hostname); host != "" {
-			return host, "host"
+			return host, resourceKindHost
 		}
 	}
+	if sourceIP := strings.TrimSpace(obs.SourceIP); sourceIP != "" {
+		return "ip:" + sourceIP, resourceKindSourceIP
+	}
 	return "", ""
+}
+
+// resourceConfidence maps a resource kind to the fraction of the endpoint
+// weight it can earn. Unknown/legacy kinds keep full weight so custom stores
+// are not penalized.
+func resourceConfidence(kind string) float64 {
+	switch kind {
+	case resourceKindHost:
+		return hostFallbackConfidence
+	case resourceKindSourceIP:
+		return sourceIPFallbackConfidence
+	default:
+		return 1.0
+	}
+}
+
+// achievableMax returns the highest score the current signal set could earn.
+// The raw component sum is expressed as a percentage of this ceiling so the
+// documented action thresholds stay reachable when only weaker signals are
+// visible. The reputation weight joins the denominator only when an
+// enrichment lookup is configured: an unenriched sensor is normalized
+// against behavior alone, while an enabled-but-erroring lookup keeps the
+// weight in the denominator so an outage cannot inflate scores.
+func achievableMax(resourceKind string, lookupEnabled bool, cfg Config) float64 {
+	max := float64(cfg.WeightEndpoint) * resourceConfidence(resourceKind)
+	max += float64(cfg.WeightVelocity)
+	max += float64(cfg.WeightBurstiness)
+	if lookupEnabled {
+		max += float64(cfg.WeightReputation)
+	}
+	return max
 }
 
 func meanAndStdDev(values []int64) (float64, float64) {

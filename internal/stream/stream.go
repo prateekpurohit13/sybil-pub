@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -26,15 +27,27 @@ type Handler func(Event)
 type Options struct {
 	MatchPort uint
 	OnEvent   Handler
+	// OnExtractError, when set, is called for TLS hello extraction failures
+	// (for example ErrBufferLimit) so callers can publish telemetry. The
+	// stream stops processing once an extraction error occurs.
+	OnExtractError func(error)
 }
 
 type Processor struct {
 	matchPort uint
+	// mu serializes every assembler call. tcpassembly.Assembler is explicitly
+	// not safe for concurrent use, and the capture goroutine (ProcessPacket)
+	// runs alongside the flush ticker (FlushOlderThan) and the shutdown drain
+	// (FlushAll). The lock is held only across the assembler call itself.
+	mu        sync.Mutex
 	assembler *tcpassembly.Assembler
 }
 
 func NewProcessor(opts Options) *Processor {
-	streamFactory := &tlsStreamFactory{onEvent: opts.OnEvent}
+	streamFactory := &tlsStreamFactory{
+		onEvent:        opts.OnEvent,
+		onExtractError: opts.OnExtractError,
+	}
 	pool := tcpassembly.NewStreamPool(streamFactory)
 
 	return &Processor{
@@ -78,28 +91,40 @@ func (p *Processor) ProcessPacket(packet gopacket.Packet) {
 		timestamp = metadata.Timestamp
 	}
 
+	p.mu.Lock()
 	p.assembler.AssembleWithTimestamp(netFlow, tcp, timestamp)
+	p.mu.Unlock()
 }
 
 func (p *Processor) FlushOlderThan(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.assembler.FlushOlderThan(t)
 }
 
-// FlushAll drains every pending stream. It is intended for offline pcap
-// processing, where no more packets will arrive.
+// FlushAll drains and closes every tracked stream. It gives each extractor a
+// final chance to emit a hello that was still buffered when capture stopped,
+// so shutdown does not drop idle streams.
 func (p *Processor) FlushAll() {
+	if p == nil || p.assembler == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.assembler.FlushAll()
 }
 
 type tlsStreamFactory struct {
-	onEvent Handler
+	onEvent        Handler
+	onExtractError func(error)
 }
 
 func (f *tlsStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
 	return &tlsStream{
-		net:       net,
-		transport: transport,
-		onEvent:   f.onEvent,
+		net:            net,
+		transport:      transport,
+		onEvent:        f.onEvent,
+		onExtractError: f.onExtractError,
 	}
 }
 
@@ -108,6 +133,7 @@ type tlsStream struct {
 	extractor      tlshello.Extractor
 	done           bool
 	onEvent        Handler
+	onExtractError func(error)
 }
 
 func (s *tlsStream) Reassembled(reassemblies []tcpassembly.Reassembly) {
@@ -124,40 +150,61 @@ func (s *tlsStream) Reassembled(reassemblies []tcpassembly.Reassembly) {
 		hello, err := s.extractor.Feed(data)
 		if err != nil {
 			s.done = true
+			if s.onExtractError != nil {
+				s.onExtractError(err)
+			}
 			return
 		}
 		if hello == nil {
 			continue
 		}
 
-		event := Event{
-			NetFlow:       s.net,
-			TransportFlow: s.transport,
-			Hello:         hello,
-		}
-
-		if hello.Type == tlshello.ClientHello {
-			fields, err := parser.ParseClientHello(hello.RecordBytes)
-			if err != nil {
-				event.ParseError = err
-			} else {
-				event.Fields = fields
-
-				ja4, err := fingerprint.BuildJA4(fields)
-				if err != nil {
-					event.FingerprintError = err
-				} else {
-					event.JA4 = &ja4
-				}
-			}
-		}
-
-		if s.onEvent != nil {
-			s.onEvent(event)
-		}
-		s.done = true
+		s.handleHello(hello)
 		return
 	}
 }
 
-func (s *tlsStream) ReassemblyComplete() {}
+// ReassemblyComplete is called when the assembler closes or flushes the
+// stream. Let the extractor force a final scan so a complete hello blocked by
+// an incomplete false-positive candidate is still reported.
+func (s *tlsStream) ReassemblyComplete() {
+	if s.done {
+		return
+	}
+
+	if hello := s.extractor.Finish(); hello != nil {
+		s.handleHello(hello)
+	}
+}
+
+func (s *tlsStream) handleHello(hello *tlshello.Hello) {
+	s.done = true
+
+	event := Event{
+		NetFlow:       s.net,
+		TransportFlow: s.transport,
+		Hello:         hello,
+	}
+
+	if hello.Type == tlshello.ClientHello {
+		// Parse the defragmented handshake message rather than the first
+		// TLS record: a large ClientHello can span several records.
+		fields, err := parser.ParseClientHelloHandshake(hello.HandshakeBytes, hello.RecordVersion)
+		if err != nil {
+			event.ParseError = err
+		} else {
+			event.Fields = fields
+
+			ja4, err := fingerprint.BuildJA4(fields)
+			if err != nil {
+				event.FingerprintError = err
+			} else {
+				event.JA4 = &ja4
+			}
+		}
+	}
+
+	if s.onEvent != nil {
+		s.onEvent(event)
+	}
+}

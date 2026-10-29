@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 
-
 def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     python = os.path.join(root, ".demo", "venv", "bin", "python")

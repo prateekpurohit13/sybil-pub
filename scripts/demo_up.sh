@@ -207,4 +207,5 @@ EOF
   "${LOOKUP_ARGS[@]}" \
   -risk-demo \
   -risk-key-prefix "${PREFIX}" \
-  -http-addr "${API_ADDR}"
+  -http-addr "${API_ADDR}" \
+  -http-cors-origins "http://localhost:${FE_PORT},http://127.0.0.1:${FE_PORT}"

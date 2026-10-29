@@ -8,6 +8,8 @@ bin/
 
 # Test binary, built with `go test -c`
 *.test
+
+# Local-only TLS test artifacts (throwaway certs in scripts/testdata/); never commit
 *.pem
 
 # Code coverage profiles and other test artifacts

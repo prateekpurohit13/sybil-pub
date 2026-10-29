@@ -8,22 +8,76 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
+// Retention and bounding rules for this Redis store. Every key class is
+// bounded by a function of traffic rate rather than process uptime, so a
+// headless sensor whose dashboard endpoints are never polled cannot grow
+// Redis without limit:
+//
+//	api:stats:total            one hash, 4 fixed verdict fields, no TTL needed
+//	api:stats:hour:<unix>      1 key/hour, TTL 48h                     -> 48 keys
+//	api:requests:recent        list trimmed to defaultRecentLimit
+//	api:request:<id>           1 key/request, TTL 25h                 -> 25h * rate
+//	api:requests:top_threats   zset rank-capped at maxTopThreats (writes evict
+//	                           the weakest scores), so it is bounded even when
+//	                           /api/requests/top-threats is never scraped
+//	api:fingerprints:*         counts/scores/display/labels/kinds/last_seen keys
+//	                           carry a 48h TTL refreshed on write, plus an
+//	                           amortized last-seen prune and a maxFingerprints
+//	                           rank cap on the counts zset
+//	api:fingerprints:hour:<ts> count+score hash per hour bucket, TTL 2h; the
+//	                           last-hour endpoints read the current and previous
+//	                           bucket instead of scanning every request payload
 const (
-	defaultRecentLimit      = 10
-	defaultTopLimit         = 10
-	hourRetention           = 48 * time.Hour
-	requestRetention        = 25 * time.Hour
+	defaultRecentLimit = 10
+	defaultTopLimit    = 10
+
+	// requestRetention must stay >= 24h (top-threat age cutoff) and >= the
+	// last-hour read window so request payloads outlive their zset entries.
+	requestRetention = 25 * time.Hour
+	// hourRetention covers the 24h timeseries query plus one hour of clock
+	// skew, so Timeseries(now) can always read a full day of buckets.
+	hourRetention = 48 * time.Hour
+	// fingerprintRetention is how long an inactive fingerprint's aggregate
+	// fields survive. The TTL is refreshed on every write, so pruning by
+	// last-seen is what actually bounds cardinality under continuous traffic;
+	// the TTL is the backstop for a prefix that stops receiving writes.
+	fingerprintRetention = 48 * time.Hour
+	// fingerprintHourRetention keeps the current and previous hourly counter
+	// buckets for the last-hour endpoints; 2h covers the window plus the
+	// bucket boundary.
+	fingerprintHourRetention = 2 * time.Hour
+
+	// maxTopThreats caps the by-score threat zset. defaultTopLimit is the
+	// dashboard page size, so this leaves ~100 pages of headroom.
+	maxTopThreats = 1000
+	// maxFingerprints caps the number of distinct fingerprints kept in the
+	// all-time common-fingerprint aggregate.
+	maxFingerprints = 10000
+	// fingerprintPruneInterval amortizes the O(stale) last-seen prune across
+	// records: one prune per N Record calls, so hot-path overhead is ~1/N.
+	fingerprintPruneInterval = 256
+
 	fingerprintTopScoreBase = 1_000_000_0000
+	// Per-hour bucket hash fields are prefixed so count and score-sum can
+	// share one hash key (and therefore one TTL) per hour.
+	fingerprintCountFieldPrefix = "c:"
+	fingerprintScoreFieldPrefix = "s:"
 )
 
 type RedisStore struct {
 	client redis.Cmdable
 	prefix string
+
+	// recordCount drives the amortized fingerprint prune. Record is called
+	// from the single capture goroutine today; atomic keeps the counter safe
+	// if writes are ever parallelized.
+	recordCount atomic.Int64
 }
 
 func NewRedisStore(client redis.Cmdable, prefix string) *RedisStore {
@@ -77,7 +131,16 @@ func (s *RedisStore) Record(ctx context.Context, obs RequestObservation) error {
 	}
 
 	hourKey := s.hourKey(obs.Timestamp)
+	fingerprintHourKey := s.fingerprintHourKey(obs.Timestamp)
 	requestKey := s.key("api", "request", strconv.FormatInt(id, 10))
+	recentKey := s.key("api", "requests", "recent")
+	threatKey := s.key("api", "requests", "top_threats")
+	countsKey := s.key("api", "fingerprints", "counts")
+	scoresKey := s.key("api", "fingerprints", "scores")
+	displayKey := s.key("api", "fingerprints", "display")
+	labelsKey := s.key("api", "fingerprints", "labels")
+	kindsKey := s.key("api", "fingerprints", "kinds")
+	lastSeenKey := s.key("api", "fingerprints", "last_seen")
 	memberID := strconv.FormatInt(id, 10)
 	verdict := normalizeVerdict(obs.Verdict)
 
@@ -89,27 +152,50 @@ func (s *RedisStore) Record(ctx context.Context, obs RequestObservation) error {
 	pipe.HIncrBy(ctx, hourKey, verdict, 1)
 	pipe.Expire(ctx, hourKey, hourRetention)
 
-	pipe.LPush(ctx, s.key("api", "requests", "recent"), payload)
-	pipe.LTrim(ctx, s.key("api", "requests", "recent"), 0, defaultRecentLimit-1)
+	pipe.LPush(ctx, recentKey, payload)
+	pipe.LTrim(ctx, recentKey, 0, defaultRecentLimit-1)
 
 	pipe.Set(ctx, requestKey, payload, requestRetention)
-	pipe.ZAdd(ctx, s.key("api", "requests", "top_threats"), redis.Z{
+	pipe.ZAdd(ctx, threatKey, redis.Z{
 		Score:  topThreatScore(request.ThreatScore, obs.Timestamp),
 		Member: memberID,
 	})
-	pipe.ZAdd(ctx, s.key("api", "requests", "top_threats_by_time"), redis.Z{
-		Score:  float64(obs.Timestamp.Unix()),
-		Member: memberID,
-	})
+	// Keep only the strongest maxTopThreats entries. The rank cap makes the
+	// zset memory-bound even when /api/requests/top-threats is never polled,
+	// which is what let the old time-keyed zset grow with every request.
+	pipe.ZRemRangeByRank(ctx, threatKey, 0, -(maxTopThreats + 1))
 
-	pipe.ZIncrBy(ctx, s.key("api", "fingerprints", "counts"), 1, obs.JA4Fingerprint)
-	pipe.HIncrBy(ctx, s.key("api", "fingerprints", "scores"), obs.JA4Fingerprint, int64(obs.ThreatScore))
-	pipe.HSet(ctx, s.key("api", "fingerprints", "display"), obs.JA4Fingerprint, obs.Fingerprint)
-	pipe.HSet(ctx, s.key("api", "fingerprints", "labels"), obs.JA4Fingerprint, obs.Label)
-	pipe.HSet(ctx, s.key("api", "fingerprints", "kinds"), obs.JA4Fingerprint, obs.FingerprintKind)
+	pipe.ZIncrBy(ctx, countsKey, 1, obs.JA4Fingerprint)
+	pipe.HIncrBy(ctx, scoresKey, obs.JA4Fingerprint, int64(obs.ThreatScore))
+	pipe.HSet(ctx, displayKey, obs.JA4Fingerprint, obs.Fingerprint)
+	pipe.HSet(ctx, labelsKey, obs.JA4Fingerprint, obs.Label)
+	pipe.HSet(ctx, kindsKey, obs.JA4Fingerprint, obs.FingerprintKind)
+	pipe.ZAdd(ctx, lastSeenKey, redis.Z{
+		Score:  float64(obs.Timestamp.Unix()),
+		Member: obs.JA4Fingerprint,
+	})
+	for _, key := range []string{countsKey, scoresKey, displayKey, labelsKey, kindsKey, lastSeenKey} {
+		pipe.Expire(ctx, key, fingerprintRetention)
+	}
+
+	// Per-hour buckets power the last-hour endpoints with a bounded read:
+	// two HGetAll calls instead of ZRangeByScore(+inf) across every request
+	// in the window plus one MGET per request ID.
+	pipe.HIncrBy(ctx, fingerprintHourKey, fingerprintCountFieldPrefix+obs.JA4Fingerprint, 1)
+	pipe.HIncrBy(ctx, fingerprintHourKey, fingerprintScoreFieldPrefix+obs.JA4Fingerprint, int64(obs.ThreatScore))
+	pipe.Expire(ctx, fingerprintHourKey, fingerprintHourRetention)
 
 	_, err = pipe.Exec(ctx)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Prune inactive fingerprints periodically, not on every record: the scan
+	// is O(stale fields) and amortizing it keeps the hot path cheap.
+	if s.recordCount.Add(1)%fingerprintPruneInterval == 0 {
+		_ = s.pruneFingerprints(ctx, obs.Timestamp)
+	}
+	return nil
 }
 
 func (s *RedisStore) TotalStats(ctx context.Context) (TotalStats, error) {
@@ -181,8 +267,8 @@ func (s *RedisStore) TopThreats(ctx context.Context, limit int, now time.Time) (
 	if limit <= 0 {
 		limit = defaultTopLimit
 	}
-	if err := s.pruneTopThreats(ctx, now); err != nil {
-		return nil, err
+	if limit > maxTopThreats {
+		limit = maxTopThreats
 	}
 
 	ids, err := s.client.ZRevRange(ctx, s.key("api", "requests", "top_threats"), 0, int64(limit-1)).Result()
@@ -324,96 +410,90 @@ func (s *RedisStore) TopFingerprintsLastHour(ctx context.Context, now time.Time,
 	return entries, nil
 }
 
+// fingerprintStatsLastHour aggregates the current and previous per-hour
+// fingerprint buckets. The read is bounded by the number of distinct
+// fingerprints observed in those two buckets, independent of request volume,
+// unlike the old implementation which fetched every request ID in the window
+// and MGET'd each payload.
+//
+// The window is bucket-aligned rather than an exact trailing 60 minutes: at
+// 10:05 it covers 09:00-11:00. Callers report WindowMinutes=60 and treat this
+// as "recent fingerprints"; the per-bucket counters expire after
+// fingerprintHourRetention so Redis memory stays bounded.
 func (s *RedisStore) fingerprintStatsLastHour(ctx context.Context, now time.Time) (map[string]FingerprintEntry, error) {
-	cutoff := now.Add(-1 * time.Hour).Unix()
-	ids, err := s.client.ZRangeByScore(ctx, s.key("api", "requests", "top_threats_by_time"), &redis.ZRangeBy{
-		Min: strconv.FormatInt(cutoff, 10),
-		Max: "+inf",
-	}).Result()
-	if err != nil && err != redis.Nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return map[string]FingerprintEntry{}, nil
-	}
-
-	requests, err := s.loadRequestsByID(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-
-	type aggregate struct {
-		count      int64
-		totalScore int64
-		display    string
-	}
-	agg := make(map[string]*aggregate)
-	for _, req := range requests {
-		fingerprint := strings.TrimSpace(req.JA4Fingerprint)
-		if fingerprint == "" {
-			fingerprint = strings.TrimSpace(req.JA3Hash)
-		}
-		if fingerprint == "" {
-			continue
-		}
-
-		item := agg[fingerprint]
-		if item == nil {
-			item = &aggregate{}
-			agg[fingerprint] = item
-		}
-
-		item.count++
-		item.totalScore += int64(req.ThreatScore)
-		if item.display == "" {
-			item.display = strings.TrimSpace(req.Fingerprint)
-		}
-	}
-
-	fields := make([]string, 0, len(agg))
-	for fingerprint := range agg {
-		fields = append(fields, fingerprint)
-	}
-	sort.Strings(fields)
+	current := now.UTC().Truncate(time.Hour)
+	keys := []string{s.fingerprintHourKey(current), s.fingerprintHourKey(current.Add(-time.Hour))}
 
 	pipe := s.client.Pipeline()
-	labelCmd := pipe.HMGet(ctx, s.key("api", "fingerprints", "labels"), fields...)
-	kindCmd := pipe.HMGet(ctx, s.key("api", "fingerprints", "kinds"), fields...)
+	cmds := make([]*redis.MapStringStringCmd, 0, len(keys))
+	for _, key := range keys {
+		cmds = append(cmds, pipe.HGetAll(ctx, key))
+	}
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, err
 	}
 
-	labels := map[string]string{}
-	kinds := map[string]string{}
-	for idx, fingerprint := range fields {
-		labels[fingerprint] = strings.TrimSpace(stringValue(labelCmd.Val()[idx]))
-		kinds[fingerprint] = strings.TrimSpace(stringValue(kindCmd.Val()[idx]))
+	counts := make(map[string]int64)
+	totalScores := make(map[string]int64)
+	for _, cmd := range cmds {
+		for field, raw := range cmd.Val() {
+			switch {
+			case strings.HasPrefix(field, fingerprintCountFieldPrefix):
+				fingerprint := strings.TrimPrefix(field, fingerprintCountFieldPrefix)
+				counts[fingerprint] += parseInt64(raw)
+			case strings.HasPrefix(field, fingerprintScoreFieldPrefix):
+				fingerprint := strings.TrimPrefix(field, fingerprintScoreFieldPrefix)
+				totalScores[fingerprint] += parseInt64(raw)
+			}
+		}
+	}
+	if len(counts) == 0 {
+		return map[string]FingerprintEntry{}, nil
 	}
 
-	stats := make(map[string]FingerprintEntry, len(agg))
-	for fingerprint, item := range agg {
-		display := strings.TrimSpace(item.display)
+	fields := make([]string, 0, len(counts))
+	for fingerprint := range counts {
+		fields = append(fields, fingerprint)
+	}
+	sort.Strings(fields)
+
+	metaPipe := s.client.Pipeline()
+	displayCmd := metaPipe.HMGet(ctx, s.key("api", "fingerprints", "display"), fields...)
+	labelCmd := metaPipe.HMGet(ctx, s.key("api", "fingerprints", "labels"), fields...)
+	kindCmd := metaPipe.HMGet(ctx, s.key("api", "fingerprints", "kinds"), fields...)
+	if _, err := metaPipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	stats := make(map[string]FingerprintEntry, len(counts))
+	for idx, fingerprint := range fields {
+		count := counts[fingerprint]
+		if count <= 0 {
+			continue
+		}
+
+		display := strings.TrimSpace(stringValue(displayCmd.Val()[idx]))
 		if display == "" {
 			display = fingerprint
 		}
-		label := strings.TrimSpace(labels[fingerprint])
+		label := strings.TrimSpace(stringValue(labelCmd.Val()[idx]))
 		if label == "" {
 			label = "Unknown JA4 Client"
 		}
-		kind := strings.TrimSpace(kinds[fingerprint])
+		kind := strings.TrimSpace(stringValue(kindCmd.Val()[idx]))
 		if kind == "" {
 			kind = "ja4"
 		}
 
 		avg := 0
-		if item.count > 0 {
-			avg = int(math.Round(float64(item.totalScore) / float64(item.count)))
+		if count > 0 {
+			avg = int(math.Round(float64(totalScores[fingerprint]) / float64(count)))
 		}
 
 		stats[fingerprint] = FingerprintEntry{
 			JA3Hash:         fingerprint,
 			Fingerprint:     display,
-			Count:           item.count,
+			Count:           count,
 			AvgThreatScore:  avg,
 			Label:           label,
 			FingerprintKind: kind,
@@ -456,40 +536,63 @@ func (s *RedisStore) loadRequestsByID(ctx context.Context, ids []string) ([]TLSR
 
 	if len(stale) > 0 {
 		_, _ = s.client.ZRem(ctx, s.key("api", "requests", "top_threats"), toMembers(stale)...).Result()
-		_, _ = s.client.ZRem(ctx, s.key("api", "requests", "top_threats_by_time"), toMembers(stale)...).Result()
 	}
 
 	return out, nil
 }
 
-func (s *RedisStore) pruneTopThreats(ctx context.Context, now time.Time) error {
+// pruneFingerprints removes aggregate fields for fingerprints whose last-seen
+// timestamp is older than fingerprintRetention. The caller invokes it every
+// fingerprintPruneInterval records so the ZRangeByScore scan is amortized;
+// key TTLs alone cannot bound cardinality because every Record refreshes the
+// shared key TTL while old fields stay inside it.
+func (s *RedisStore) pruneFingerprints(ctx context.Context, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
-	cutoff := now.Add(-24 * time.Hour).Unix()
+	cutoff := now.Add(-fingerprintRetention).Unix()
 
-	stale, err := s.client.ZRangeByScore(ctx, s.key("api", "requests", "top_threats_by_time"), &redis.ZRangeBy{
+	countsKey := s.key("api", "fingerprints", "counts")
+	scoresKey := s.key("api", "fingerprints", "scores")
+	displayKey := s.key("api", "fingerprints", "display")
+	labelsKey := s.key("api", "fingerprints", "labels")
+	kindsKey := s.key("api", "fingerprints", "kinds")
+	lastSeenKey := s.key("api", "fingerprints", "last_seen")
+
+	stale, err := s.client.ZRangeByScore(ctx, lastSeenKey, &redis.ZRangeBy{
 		Min: "-inf",
-		Max: strconv.FormatInt(cutoff-1, 10),
+		Max: strconv.FormatInt(cutoff, 10),
 	}).Result()
 	if err != nil && err != redis.Nil {
 		return err
 	}
-	if len(stale) == 0 {
-		return nil
-	}
 
 	pipe := s.client.TxPipeline()
-	pipe.ZRem(ctx, s.key("api", "requests", "top_threats_by_time"), toMembers(stale)...)
-	pipe.ZRem(ctx, s.key("api", "requests", "top_threats"), toMembers(stale)...)
+	if len(stale) > 0 {
+		members := toMembers(stale)
+		pipe.ZRem(ctx, countsKey, members...)
+		pipe.HDel(ctx, scoresKey, stale...)
+		pipe.HDel(ctx, displayKey, stale...)
+		pipe.HDel(ctx, labelsKey, stale...)
+		pipe.HDel(ctx, kindsKey, stale...)
+		pipe.ZRem(ctx, lastSeenKey, members...)
+	}
+	// Hard backstop: keep the most-seen maxFingerprints entries even if they
+	// are all still fresh. Meta fields for rank-evicted members are dropped by
+	// the next last-seen prune.
+	pipe.ZRemRangeByRank(ctx, countsKey, 0, -(maxFingerprints + 1))
 	_, err = pipe.Exec(ctx)
 	return err
 }
 
 func (s *RedisStore) hourKey(ts time.Time) string {
 	return s.key("api", "stats", "hour", strconv.FormatInt(ts.UTC().Truncate(time.Hour).Unix(), 10))
+}
+
+func (s *RedisStore) fingerprintHourKey(ts time.Time) string {
+	return s.key("api", "fingerprints", "hour", strconv.FormatInt(ts.UTC().Truncate(time.Hour).Unix(), 10))
 }
 
 func (s *RedisStore) key(parts ...string) string {

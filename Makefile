@@ -1,4 +1,4 @@
-.PHONY: build test setup generate run run-pcap demo demo-deps verify-ja4 ja4-db clean
+.PHONY: build test vet setup generate run run-pcap demo demo-deps benchmark verify-ja4 ja4-db clean
 
 IFACE ?= wlan0
 DEMO_IFACE ?=
@@ -17,6 +17,9 @@ build: generate
 	go build -o bin/sybil .
 	go build -o bin/ja4check ./cmd/ja4check
 	go build -o bin/ja4import ./cmd/ja4import
+
+vet:
+	go vet ./...
 
 run: build
 	sudo ./bin/sybil -iface $(IFACE)
@@ -52,6 +55,9 @@ ja4-db:
 
 setup:
 	git config core.hooksPath .githooks
+
+benchmark: build
+	sudo IFACE=lo ./scripts/benchmark.sh
 
 clean:
 	rm -rf bin

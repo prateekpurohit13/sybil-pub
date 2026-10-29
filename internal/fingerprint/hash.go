@@ -10,6 +10,11 @@ import (
 	"github.com/sophic00/sybil/internal/parser"
 )
 
+// emptyBlobHash is the literal JA4_b / JA4_c value used when the hashed
+// input list is empty, per the FoxIO JA4 specification. The reference
+// explicitly avoids a sha256("") of e3b0c44298fc for these fields.
+const emptyBlobHash = "000000000000"
+
 // JA4 represents the three JA4 parts and the combined fingerprint string.
 type JA4 struct {
 	A string
@@ -24,6 +29,16 @@ type JA4 struct {
 }
 
 // BuildJA4 constructs JA4 fingerprint parts from parsed ClientHello fields.
+//
+// It follows the FoxIO JA4 specification:
+//   - JA4_b is the truncated SHA-256 of the GREASE-filtered cipher suites
+//     sorted in hex order, comma delimited.
+//   - JA4_c is the truncated SHA-256 of the GREASE-filtered extension list
+//     (sorted, with SNI and ALPN removed), followed by the signature
+//     algorithms in wire order; the two lists are delimited by an
+//     underscore.
+//   - Empty cipher and empty extension lists hash to the literal
+//     "000000000000" instead of a hash of the empty string.
 func BuildJA4(fields *parser.ClientHelloFields) (JA4, error) {
 	if fields == nil {
 		return JA4{}, fmt.Errorf("nil clienthello fields")
@@ -31,13 +46,15 @@ func BuildJA4(fields *parser.ClientHelloFields) (JA4, error) {
 
 	a := buildA(fields)
 
-	ciphers := copySlice(fields.CipherSuites)
+	ciphers := make([]uint16, 0, len(fields.CipherSuites))
+	for _, c := range fields.CipherSuites {
+		if !isGREASEValue(c) {
+			ciphers = append(ciphers, c)
+		}
+	}
 	sort.Slice(ciphers, func(i, j int) bool { return ciphers[i] < ciphers[j] })
 	blobB := buildHexBlob(ciphers)
-	b := emptyHash
-	if blobB != "" {
-		b = hash12(blobB)
-	}
+	b := hashBlob(blobB)
 
 	ext := make([]uint16, 0, len(fields.Extensions))
 	for _, e := range fields.Extensions {
@@ -48,19 +65,28 @@ func BuildJA4(fields *parser.ClientHelloFields) (JA4, error) {
 	}
 	sort.Slice(ext, func(i, j int) bool { return ext[i] < ext[j] })
 
-	sigs := copySlice(fields.SignatureAlgorithms)
-	// Keep signature algorithms in wire order (no sorting).
+	sigs := make([]uint16, 0, len(fields.SignatureAlgorithms))
+	for _, s := range fields.SignatureAlgorithms {
+		if !isGREASEValue(s) {
+			sigs = append(sigs, s)
+		}
+	}
+	// Keep signature algorithms in wire order (no sorting), per spec.
 
 	extBlob := buildHexBlob(ext)
 	sigBlob := buildHexBlob(sigs)
+
 	blobC := extBlob
-	if extBlob != "" && sigBlob != "" {
+	if extBlob == "" {
+		// Spec: if there are no extensions in the sorted list, JA4_c is
+		// the literal empty hash (regardless of any signature algorithms).
+		blobC = ""
+	} else if sigBlob != "" {
+		// Sorted extensions and signature algorithms are delimited by an
+		// underscore in the JA4_c hash input.
 		blobC = extBlob + "_" + sigBlob
 	}
-	c := emptyHash
-	if extBlob != "" {
-		c = hash12(blobC)
-	}
+	c := hashBlob(blobC)
 
 	return JA4{
 		A:           a,
@@ -83,72 +109,74 @@ func buildA(fields *parser.ClientHelloFields) string {
 		sniType = "i"
 	}
 
-	alpn := normalizeALPN(fields.FirstALPN)
-
-	return fmt.Sprintf("%s%s%s%02d%02d%s", proto, tlsVersionTag(fields.TLSVersion), sniType,
-		clampCount(fields.CipherCount), clampCount(fields.ExtensionCount), alpn)
+	return proto +
+		tlsVersionCode(fields.TLSVersion) +
+		sniType +
+		countField(fields.CipherCount) +
+		countField(fields.ExtensionCount) +
+		normalizeALPN(fields.FirstALPN)
 }
 
-const emptyHash = "000000000000"
-
-func tlsVersionTag(version uint16) string {
-	switch version {
+// tlsVersionCode maps the effective ClientHello version to the JA4_a
+// two-character code from the FoxIO specification.
+func tlsVersionCode(v uint16) string {
+	switch v {
 	case 0x0304:
-		return "13"
+		return "13" // TLS 1.3
 	case 0x0303:
-		return "12"
+		return "12" // TLS 1.2
 	case 0x0302:
-		return "11"
+		return "11" // TLS 1.1
 	case 0x0301:
-		return "10"
+		return "10" // TLS 1.0
 	case 0x0300:
-		return "s3"
+		return "s3" // SSL 3.0
 	case 0x0002:
-		return "s2"
+		return "s2" // SSL 2.0
 	case 0xfeff:
-		return "d1"
+		return "d1" // DTLS 1.0
 	case 0xfefd:
-		return "d2"
+		return "d2" // DTLS 1.2
 	case 0xfefc:
-		return "d3"
+		return "d3" // DTLS 1.3
 	default:
 		return "00"
 	}
 }
 
-func clampCount(count int) int {
-	if count < 0 {
-		return 0
+// countField renders the two-character count fields. Per spec the value is
+// clamped to 99 so JA4_a keeps its fixed-width layout.
+func countField(n int) string {
+	if n < 0 {
+		n = 0
 	}
-	if count > 99 {
-		return 99
+	if n > 99 {
+		n = 99
 	}
-	return count
+	return fmt.Sprintf("%02d", n)
 }
 
-// normalizeALPN returns the first and last character of the first ALPN value.
-// Non-alphanumeric edges use the first and last character of the hex encoding,
-// matching the FoxIO JA4 specification.
-func normalizeALPN(alpn string) string {
-	if alpn == "" {
+// normalizeALPN encodes the first ALPN value for JA4_a:
+//   - no/empty value => "00"
+//   - otherwise the first and last ASCII alphanumeric characters
+//     (a single character is used as both)
+//   - if either end byte is not ASCII alphanumeric, the first and last
+//     characters of the hex representation of the whole value instead.
+func normalizeALPN(s string) string {
+	if s == "" {
 		return "00"
 	}
-
-	raw := []byte(alpn)
-	first := raw[0]
-	last := raw[len(raw)-1]
-	if isASCIIAlnum(first) && isASCIIAlnum(last) {
-		return strings.ToLower(string([]byte{first, last}))
+	b := []byte(s)
+	first, last := b[0], b[len(b)-1]
+	if isASCIIAlphanumeric(first) && isASCIIAlphanumeric(last) {
+		return string([]byte{first, last})
 	}
-
-	encoded := hex.EncodeToString(raw)
-	return string([]byte{encoded[0], encoded[len(encoded)-1]})
+	hexStr := hex.EncodeToString(b)
+	return string([]byte{hexStr[0], hexStr[len(hexStr)-1]})
 }
 
-func isASCIIAlnum(value byte) bool {
-	return (value >= '0' && value <= '9') ||
-		(value >= 'A' && value <= 'Z') ||
-		(value >= 'a' && value <= 'z')
+func isASCIIAlphanumeric(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
 }
 
 func buildHexBlob(values []uint16) string {
@@ -162,6 +190,15 @@ func buildHexBlob(values []uint16) string {
 	return strings.Join(out, ",")
 }
 
+// hashBlob returns the literal empty hash for an empty blob, otherwise the
+// first 12 hex characters of its SHA-256 digest.
+func hashBlob(input string) string {
+	if input == "" {
+		return emptyBlobHash
+	}
+	return hash12(input)
+}
+
 func hash12(input string) string {
 	sum := sha256.Sum256([]byte(input))
 	hexStr := hex.EncodeToString(sum[:])
@@ -169,12 +206,6 @@ func hash12(input string) string {
 		return hexStr
 	}
 	return hexStr[:12]
-}
-
-func copySlice(in []uint16) []uint16 {
-	out := make([]uint16, len(in))
-	copy(out, in)
-	return out
 }
 
 func isGREASEValue(v uint16) bool {

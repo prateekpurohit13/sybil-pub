@@ -179,6 +179,22 @@ Grafana:
 
 Prometheus scrapes the Sybil process from `host.docker.internal:9090`, so run the Sybil binary on the host.
 
+### Frontend Dashboard
+
+The Redis-backed dashboard is the `sybil_fe` submodule. It reads the API at
+`http://localhost:9090` by default and runs on port 3001 so it does not collide
+with Grafana.
+
+```bash
+git submodule update --init sybil_fe
+cd sybil_fe
+npm exec --yes pnpm@12.16.1 install
+npm exec --yes pnpm@12.16.1 dev
+```
+
+Open `http://localhost:3001`. The API endpoints require Sybil to be started with
+`-redis-addr`; otherwise the frontend receives `503` responses.
+
 ### Demo Flow
 
 Start Sybil with Redis and DB enrichment:

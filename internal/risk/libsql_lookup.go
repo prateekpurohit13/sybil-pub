@@ -46,6 +46,12 @@ func (c *LibSQLLookupClient) Lookup(ctx context.Context, ja4 string) (*Fingerpri
 			ja4tscan_fingerprint
 		FROM fingerprints
 		WHERE ja4_fingerprint = ?
+		ORDER BY
+			(application IS NOT NULL AND TRIM(application) <> '') DESC,
+			(library IS NOT NULL AND TRIM(library) <> '') DESC,
+			(device IS NOT NULL AND TRIM(device) <> '') DESC,
+			(os IS NOT NULL AND TRIM(os) <> '') DESC,
+			(notes IS NOT NULL AND TRIM(notes) <> '') DESC
 		LIMIT 1`, strings.TrimSpace(ja4))
 
 	var (

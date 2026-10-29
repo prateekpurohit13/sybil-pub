@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/sophic00/sybil/internal/capture"
 	"github.com/sophic00/sybil/internal/dataset"
+	sybildb "github.com/sophic00/sybil/internal/db"
 	"github.com/sophic00/sybil/internal/stream"
 	"github.com/sophic00/sybil/internal/tlshello"
 )
@@ -32,11 +34,15 @@ const (
 
 type options struct {
 	datasetPath string
+	dbPath      string
+	dbAuthToken string
 	pcapPath    string
 	ja4Inputs   []string
 	ja4File     string
 	jsonOutput  bool
 	strict      bool
+	lenient     bool
+	maxMatches  int
 	port        uint
 }
 
@@ -50,6 +56,7 @@ type observation struct {
 	DestinationPort string          `json:"destination_port,omitempty"`
 	Status          string          `json:"status"`
 	Error           string          `json:"error,omitempty"`
+	MatchCount      int             `json:"match_count"`
 	Matches         []dataset.Entry `json:"matches,omitempty"`
 }
 
@@ -112,7 +119,11 @@ func parseFlags() options {
 	var inputs stringList
 
 	flag.StringVar(&opts.datasetPath, "dataset", "datasets/ja4plus-mapping.csv", "JA4+ mapping CSV")
+	flag.StringVar(&opts.dbPath, "db", "", "libSQL/SQLite database with a fingerprints table (overrides -dataset)")
+	flag.StringVar(&opts.dbAuthToken, "db-auth-token", "", "Auth token for a remote libSQL database")
 	flag.StringVar(&opts.pcapPath, "pcap", "", "Optional pcap/pcapng file to analyze")
+	flag.BoolVar(&opts.lenient, "lenient", false, "Skip invalid JA4 rows in the CSV instead of failing")
+	flag.IntVar(&opts.maxMatches, "max-matches", 20, "Maximum matches reported per fingerprint; 0 disables the cap")
 	flag.Var(&inputs, "ja4", "JA4 fingerprint to compare (repeatable)")
 	flag.StringVar(&opts.ja4File, "ja4-file", "", "File containing one JA4 fingerprint per line")
 	flag.BoolVar(&opts.jsonOutput, "json", false, "Emit JSON instead of a table")
@@ -125,7 +136,17 @@ func parseFlags() options {
 }
 
 func run(ctx context.Context, opts options) (report, error) {
-	store, err := dataset.Load(opts.datasetPath)
+	var store *dataset.Store
+	var err error
+	if strings.TrimSpace(opts.dbPath) != "" {
+		store, err = dataset.LoadSQLite(ctx, sybildb.SQLiteConfig{
+			Driver:    "libsql",
+			DSN:       opts.dbPath,
+			AuthToken: opts.dbAuthToken,
+		})
+	} else {
+		store, err = dataset.LoadWithOptions(opts.datasetPath, dataset.Options{Lenient: opts.lenient})
+	}
 	if err != nil {
 		return report{}, err
 	}
@@ -137,17 +158,18 @@ func run(ctx context.Context, opts options) (report, error) {
 		return report{}, err
 	}
 	for _, fingerprint := range inputs {
-		status, matches := classify(store, fingerprint)
+		status, matches, total := classify(store, fingerprint)
 		result.Observations = append(result.Observations, observation{
-			Origin:  "input",
-			JA4:     fingerprint,
-			Status:  status,
-			Matches: matches,
+			Origin:     "input",
+			JA4:        fingerprint,
+			Status:     status,
+			MatchCount: total,
+			Matches:    limitMatches(matches, opts.maxMatches),
 		})
 	}
 
 	if opts.pcapPath != "" {
-		pcapObservations, err := analyzePCAP(ctx, opts.pcapPath, opts.port, store)
+		pcapObservations, err := analyzePCAP(ctx, opts.pcapPath, opts.port, store, opts.maxMatches)
 		if err != nil {
 			return report{}, err
 		}
@@ -193,7 +215,7 @@ func collectInputs(values []string, filePath string) ([]string, error) {
 	return unique, nil
 }
 
-func analyzePCAP(ctx context.Context, path string, matchPort uint, store *dataset.Store) ([]observation, error) {
+func analyzePCAP(ctx context.Context, path string, matchPort uint, store *dataset.Store, maxMatches int) ([]observation, error) {
 	source, err := capture.OpenOffline(path, matchPort)
 	if err != nil {
 		return nil, err
@@ -231,7 +253,10 @@ func analyzePCAP(ctx context.Context, path string, matchPort uint, store *datase
 				item.Error = "no ja4 fingerprint produced"
 			default:
 				item.JA4 = event.JA4.Fingerprint
-				item.Status, item.Matches = classify(store, item.JA4)
+				status, matches, total := classify(store, item.JA4)
+				item.Status = status
+				item.MatchCount = total
+				item.Matches = limitMatches(matches, maxMatches)
 			}
 
 			observations = append(observations, item)
@@ -253,22 +278,58 @@ func analyzePCAP(ctx context.Context, path string, matchPort uint, store *datase
 	return observations, nil
 }
 
-func classify(store *dataset.Store, fingerprint string) (string, []dataset.Entry) {
+func classify(store *dataset.Store, fingerprint string) (string, []dataset.Entry, int) {
 	exact := store.Candidates(fingerprint)
 	switch len(exact) {
 	case 1:
-		return statusExact, exact
+		return statusExact, exact, len(exact)
 	case 0:
 		// Fall through to prefix matching.
 	default:
-		return statusAmbiguous, exact
+		return statusAmbiguous, exact, len(exact)
 	}
 
 	prefix := store.PrefixCandidates(fingerprint)
 	if len(prefix) > 0 {
-		return statusPrefix, prefix
+		return statusPrefix, prefix, len(prefix)
 	}
-	return statusUnknown, nil
+	return statusUnknown, nil, 0
+}
+
+// limitMatches removes duplicate identities and caps the displayed matches.
+func limitMatches(entries []dataset.Entry, limit int) []dataset.Entry {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(entries))
+	out := make([]dataset.Entry, 0, len(entries))
+	for _, entry := range entries {
+		key := matchKey(entry)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func matchKey(entry dataset.Entry) string {
+	return strings.Join([]string{
+		entry.JA4,
+		entry.Application,
+		entry.Library,
+		entry.Device,
+		entry.OS,
+		entry.UserAgentString,
+		entry.CertificateAuthority,
+		strconv.FormatBool(entry.Verified),
+		entry.Notes,
+	}, "\x00")
 }
 
 func summarize(observations []observation) summary {
@@ -306,6 +367,7 @@ func printReport(out io.Writer, result report) {
 	fmt.Fprintf(writer, "ja4 rows:\t%d\n", stats.JA4Rows)
 	fmt.Fprintf(writer, "unique ja4:\t%d\n", stats.UniqueJA4)
 	fmt.Fprintf(writer, "duplicate ja4:\t%d\n", stats.DuplicateJA4)
+	fmt.Fprintf(writer, "invalid ja4:\t%d\n", stats.InvalidJA4)
 	fmt.Fprintln(writer)
 
 	if len(result.Observations) == 0 {
@@ -362,10 +424,13 @@ func identityLabel(item observation) string {
 	if label == "" {
 		label = match.Notes
 	}
-	if len(item.Matches) > 1 {
-		label = fmt.Sprintf("%s (+%d)", label, len(item.Matches)-1)
+	if label == "" {
+		label = "unknown"
 	}
-	return emptyDash(label)
+	if item.MatchCount > 1 {
+		label = fmt.Sprintf("%s (+%d more)", label, item.MatchCount-1)
+	}
+	return label
 }
 
 func emptyDash(value string) string {

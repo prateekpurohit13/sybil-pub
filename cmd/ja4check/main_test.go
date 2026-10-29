@@ -14,6 +14,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
+	"github.com/sophic00/sybil/internal/dataset"
+	sybildb "github.com/sophic00/sybil/internal/db"
 	"github.com/sophic00/sybil/internal/fingerprint"
 	"github.com/sophic00/sybil/internal/parser"
 )
@@ -43,6 +45,31 @@ func TestRunDirectLookup(t *testing.T) {
 	}
 	if result.Observations[0].Matches[0].Application != "Chromium Browser" {
 		t.Fatalf("unexpected match: %+v", result.Observations[0].Matches)
+	}
+}
+
+func TestRunDBLookup(t *testing.T) {
+	csvPath := filepath.Join("..", "..", "datasets", "ja4plus-mapping.csv")
+	store, err := dataset.Load(csvPath)
+	if err != nil {
+		t.Fatalf("load dataset: %v", err)
+	}
+
+	dsn := "file:" + filepath.Join(t.TempDir(), "ja4.db")
+	cfg := sybildb.SQLiteConfig{Driver: "libsql", DSN: dsn}
+	if _, err := dataset.ExportSQLite(context.Background(), store, cfg, true); err != nil {
+		t.Fatalf("export dataset: %v", err)
+	}
+
+	result, err := run(context.Background(), options{
+		dbPath:    dsn,
+		ja4Inputs: []string{"t13d1516h2_8daaf6152771_02713d6af862"},
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Summary.Exact != 1 || result.Observations[0].Matches[0].Application != "Chromium Browser" {
+		t.Fatalf("unexpected database result: %+v", result)
 	}
 }
 

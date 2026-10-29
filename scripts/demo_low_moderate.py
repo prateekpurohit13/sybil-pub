@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Low/moderate local profile: many SNIs, medium rate."""
+"""Moderate real-HTTPS profile."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
 
 def main() -> int:
-    return subprocess.call(
-        [sys.executable, "scripts/demo_local_target_and_load.py", "--profile", "moderate"]
-    )
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    python = os.path.join(root, ".demo", "venv", "bin", "python")
+    if not os.access(python, os.X_OK):
+        python = sys.executable
+    return subprocess.call([python, os.path.join(root, "scripts", "demo_traffic.py"), "--profile", "moderate"])
 
 
 if __name__ == "__main__":

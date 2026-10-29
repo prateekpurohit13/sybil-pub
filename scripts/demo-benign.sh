@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
-# Fast local benign profile: many SNIs, low rate.
+# Real-HTTPS browse profile: several public hosts and browser fingerprints.
 set -euo pipefail
-exec python3 scripts/demo_local_target_and_load.py --profile benign "$@"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY=python3
+if [ -x "${ROOT}/.demo/venv/bin/python" ]; then
+  PY="${ROOT}/.demo/venv/bin/python"
+fi
+exec "${PY}" "${ROOT}/scripts/demo_traffic.py" --profile browse "$@"

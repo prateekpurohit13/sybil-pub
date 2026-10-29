@@ -4,8 +4,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IFACE="${IFACE:-lo}"
-PORT="${PORT:-9443}"
+IFACE="${IFACE:-}"
+PORT="${PORT:-443}"
 REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6379}"
 API_ADDR="${API_ADDR:-:9090}"
 FE_PORT="${FE_PORT:-3001}"
@@ -27,6 +27,14 @@ mkdir -p "${DEMO_DIR}"
 
 if [ ! -d "${ROOT}/sybil_fe" ]; then
   echo "error: frontend submodule is missing; run: git submodule update --init sybil_fe" >&2
+  exit 2
+fi
+
+if [ -z "${IFACE}" ]; then
+  IFACE="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+fi
+if [ -z "${IFACE}" ]; then
+  echo "error: could not detect the default interface; set DEMO_IFACE" >&2
   exit 2
 fi
 
@@ -178,6 +186,9 @@ In another terminal:
   bash scripts/demo_reset.sh ${PREFIX}
   bash scripts/demo-benign.sh
   bash scripts/demo-suspicious.sh
+
+Traffic goes to real public HTTPS hosts. For a lab-owned app:
+  bash scripts/demo-suspicious.sh --targets https://host:port/
 
 Press Ctrl+C here to stop the backend and any services started by this script.
 

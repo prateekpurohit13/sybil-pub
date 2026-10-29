@@ -199,6 +199,12 @@ Open `http://localhost:3001`. The API endpoints require Sybil to be started with
 
 ### Demo Flow
 
+Install the optional browser-profile client once (for multiple JA4s):
+
+```bash
+make demo-deps
+```
+
 One command starts Redis, the frontend and the pcap backend:
 
 ```bash
@@ -229,10 +235,11 @@ DEMO_DB_TOKEN="$AUTH_TOKEN" \
 make demo
 ```
 
-To run the backend manually instead:
+`make demo` auto-detects the default network interface and captures TCP port
+443. To run the backend manually instead:
 
 ```bash
-sudo ./bin/sybil -backend pcap -iface lo -port 9443 \
+sudo ./bin/sybil -backend pcap -iface wlan0 -port 443 \
   -redis-addr 127.0.0.1:6379 \
   -ja4-db-url file:datasets/ja4.db \
   -risk-demo -risk-key-prefix sybil:demo
@@ -242,24 +249,44 @@ sudo ./bin/sybil -backend pcap -iface lo -port 9443 \
 (`30/45/60/75`) so the dashboard reacts within seconds. Production defaults are
 unchanged; do not use demo thresholds for real triage.
 
-In a second terminal, generate a benign profile (many SNIs, low rate):
+In a second terminal, generate a benign profile. It sends low-rate handshakes
+to several real public HTTPS hosts with several browser impersonation profiles:
 
 ```bash
 bash scripts/demo-benign.sh
 ```
 
-Generate a fast burst profile (one SNI, high rate):
+Generate a capped burst against one real HTTPS target:
 
 ```bash
 bash scripts/demo-suspicious.sh
 ```
 
+The burst defaults to `https://example.com/` at 20 handshakes/s for 10 seconds
+(200 attempts maximum). Point it at a lab-owned HTTPS target instead:
+
+```bash
+bash scripts/demo-suspicious.sh --targets https://localhost:8443/
+```
+
+For a vulnerable demo app such as OWASP Juice Shop, put a TLS terminator
+(Caddy/nginx) in front of the app and use that HTTPS URL, then start the demo
+capture on the matching interface/port:
+
+```bash
+DEMO_IFACE=lo DEMO_PORT=8443 make demo
+bash scripts/demo-suspicious.sh --targets https://localhost:8443/
+```
+
 Profiles can also be selected directly:
 
 ```bash
-python3 scripts/demo_local_target_and_load.py --profile moderate
-python3 scripts/demo_local_target_and_load.py --profile flood
+python3 scripts/demo_traffic.py --profile moderate
+python3 scripts/demo_traffic.py --profile flood
 ```
+
+Use `--engine ssl` if `curl_cffi` is not installed; this still sends real
+handshakes, but all traffic has the same Python TLS fingerprint.
 
 Reset demo state between presentations:
 
@@ -267,8 +294,9 @@ Reset demo state between presentations:
 bash scripts/demo_reset.sh sybil:demo
 ```
 
-The frontend refreshes every 2 seconds and Grafana every 2 seconds. Override
-the frontend interval with `NEXT_PUBLIC_REFRESH_MS=1000`.
+The frontend refreshes every second during `make demo`
+(`NEXT_PUBLIC_REFRESH_MS=1000`); the Grafana dashboards use a 2-second refresh
+when that stack is running separately.
 
 ### Example Test Commands
 

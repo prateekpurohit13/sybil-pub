@@ -1,7 +1,8 @@
-.PHONY: build test setup generate run run-pcap demo verify-ja4 ja4-db clean
+.PHONY: build test setup generate run run-pcap demo demo-deps verify-ja4 ja4-db clean
 
 IFACE ?= wlan0
-DEMO_IFACE ?= lo
+DEMO_IFACE ?=
+DEMO_PORT ?= 443
 REDIS_ADDR ?= 127.0.0.1:6379
 DEMO_DB_URL ?=
 DEMO_DB_TOKEN ?=
@@ -23,8 +24,12 @@ run: build
 run-pcap: build
 	sudo ./bin/sybil -backend pcap -iface $(IFACE)
 
+demo-deps:
+	python3 -m venv .demo/venv
+	.demo/venv/bin/pip install -q -r scripts/requirements-demo.txt
+
 demo:
-	IFACE="$(DEMO_IFACE)" REDIS_ADDR="$(REDIS_ADDR)" \
+	IFACE="$(DEMO_IFACE)" PORT="$(DEMO_PORT)" REDIS_ADDR="$(REDIS_ADDR)" \
 	DEMO_DB_URL="$(DEMO_DB_URL)" DEMO_DB_TOKEN="$(DEMO_DB_TOKEN)" \
 	./scripts/demo_up.sh
 

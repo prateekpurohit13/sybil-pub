@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -97,9 +98,11 @@ Test Client,Test Library,,,`+"%s"+`,,,,,,fixture
 	}
 
 	pcapPath := writeClientHelloPCAP(t, hello)
+	dumpPath := filepath.Join(dir, "hello.bin")
 	result, err := run(context.Background(), options{
 		datasetPath: datasetPath,
 		pcapPath:    pcapPath,
+		dumpHello:   dumpPath,
 		strict:      true,
 	})
 	if err != nil {
@@ -128,6 +131,14 @@ Test Client,Test Library,,,`+"%s"+`,,,,,,fixture
 	}
 	if len(item.Matches) != 1 || item.Matches[0].Application != "Test Client" {
 		t.Fatalf("unexpected matches: %+v", item.Matches)
+	}
+
+	dumped, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("read hello dump: %v", err)
+	}
+	if !bytes.Equal(dumped, hello) {
+		t.Fatalf("dumped hello differs from source\nwant=%x\ngot=%x", hello, dumped)
 	}
 }
 

@@ -37,6 +37,7 @@ type options struct {
 	dbPath      string
 	dbAuthToken string
 	pcapPath    string
+	dumpHello   string
 	ja4Inputs   []string
 	ja4File     string
 	jsonOutput  bool
@@ -123,6 +124,7 @@ func parseFlags() options {
 	flags.StringVar(&opts.dbPath, "db", "", "libSQL/SQLite database with a fingerprints table (overrides -dataset)")
 	flags.StringVar(&opts.dbAuthToken, "db-auth-token", "", "Auth token for a remote libSQL database")
 	flags.StringVar(&opts.pcapPath, "pcap", "", "Optional pcap/pcapng file to analyze")
+	flags.StringVar(&opts.dumpHello, "dump-hello", "", "Write the first ClientHello record bytes from -pcap to this file")
 	flags.BoolVar(&opts.lenient, "lenient", false, "Skip invalid JA4 rows in the CSV instead of failing")
 	flags.IntVar(&opts.maxMatches, "max-matches", 20, "Maximum matches reported per fingerprint; 0 disables the cap")
 	flags.Var(&inputs, "ja4", "JA4 fingerprint to compare (repeatable)")
@@ -170,7 +172,7 @@ func run(ctx context.Context, opts options) (report, error) {
 	}
 
 	if opts.pcapPath != "" {
-		pcapObservations, err := analyzePCAP(ctx, opts.pcapPath, opts.port, store, opts.maxMatches)
+		pcapObservations, err := analyzePCAP(ctx, opts.pcapPath, opts.port, store, opts.maxMatches, opts.dumpHello)
 		if err != nil {
 			return report{}, err
 		}
@@ -216,7 +218,7 @@ func collectInputs(values []string, filePath string) ([]string, error) {
 	return unique, nil
 }
 
-func analyzePCAP(ctx context.Context, path string, matchPort uint, store *dataset.Store, maxMatches int) ([]observation, error) {
+func analyzePCAP(ctx context.Context, path string, matchPort uint, store *dataset.Store, maxMatches int, dumpHello string) ([]observation, error) {
 	source, err := capture.OpenOffline(path, matchPort)
 	if err != nil {
 		return nil, err
@@ -224,11 +226,21 @@ func analyzePCAP(ctx context.Context, path string, matchPort uint, store *datase
 	defer source.Close()
 
 	observations := make([]observation, 0)
+	dumped := false
+	var dumpErr error
 	processor := stream.NewProcessor(stream.Options{
 		MatchPort: matchPort,
 		OnEvent: func(event stream.Event) {
 			if event.Hello == nil || event.Hello.Type != tlshello.ClientHello {
 				return
+			}
+
+			if !dumped && strings.TrimSpace(dumpHello) != "" {
+				if err := os.WriteFile(dumpHello, event.Hello.RecordBytes, 0o644); err != nil {
+					dumpErr = err
+				} else {
+					dumped = true
+				}
 			}
 
 			item := observation{
@@ -276,6 +288,9 @@ func analyzePCAP(ctx context.Context, path string, matchPort uint, store *datase
 	}
 	processor.FlushAll()
 
+	if dumpErr != nil {
+		return nil, fmt.Errorf("write hello dump: %w", dumpErr)
+	}
 	return observations, nil
 }
 

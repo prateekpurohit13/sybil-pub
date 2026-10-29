@@ -42,6 +42,10 @@ type Risk struct {
 	JA4DBAuthToken   string
 	JA4CacheTTL      time.Duration
 	UseHostFallback  bool
+	DemoMode         bool
+	BucketSeconds    int
+	BurstMinBuckets  int
+	BurstMinRequests int64
 	DelayThreshold   int
 	RateLimitThresh  int
 	ChallengeThresh  int
@@ -73,6 +77,10 @@ func Parse() Config {
 	flag.StringVar(&cfg.Risk.JA4DBAuthToken, "ja4-db-auth-token", os.Getenv("AUTH_TOKEN"), "Optional auth token for the JA4 libSQL/Turso database")
 	flag.DurationVar(&cfg.Risk.JA4CacheTTL, "ja4-cache-ttl", 30*time.Minute, "Redis TTL for cached JA4 enrichment lookups")
 	flag.BoolVar(&cfg.Risk.UseHostFallback, "risk-use-host-fallback", true, "Use SNI host as a weaker diversity signal when the real endpoint path is unavailable")
+	flag.BoolVar(&cfg.Risk.DemoMode, "risk-demo", false, "Fast demo scoring: 5s buckets, short windows, lower action thresholds")
+	flag.IntVar(&cfg.Risk.BucketSeconds, "risk-bucket-seconds", 0, "Scoring bucket width in seconds (0 uses the preset/default)")
+	flag.IntVar(&cfg.Risk.BurstMinBuckets, "risk-burst-min-buckets", 0, "Minimum active buckets before burstiness scores (0 uses preset/default)")
+	flag.Int64Var(&cfg.Risk.BurstMinRequests, "risk-burst-min-requests", 0, "Minimum requests before burstiness scores (0 uses preset/default)")
 	flag.IntVar(&cfg.Risk.DelayThreshold, "risk-delay-threshold", -1, "Optional override for delay threshold (default scorer config when negative)")
 	flag.IntVar(&cfg.Risk.RateLimitThresh, "risk-rate-limit-threshold", -1, "Optional override for rate-limit threshold (default scorer config when negative)")
 	flag.IntVar(&cfg.Risk.ChallengeThresh, "risk-challenge-threshold", -1, "Optional override for challenge threshold (default scorer config when negative)")

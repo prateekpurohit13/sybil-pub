@@ -33,6 +33,9 @@ type Config struct {
 	MinuteWindow       time.Duration
 	ResourceWindow     time.Duration
 	HourWindow         time.Duration
+	BucketSeconds      int
+	BurstMinBuckets    int
+	BurstMinRequests   int64
 	UseHostFallback    bool
 	WeightEndpoint     int
 	WeightVelocity     int
@@ -51,6 +54,9 @@ func DefaultConfig() Config {
 		MinuteWindow:       time.Hour,
 		ResourceWindow:     time.Hour,
 		HourWindow:         24 * time.Hour,
+		BucketSeconds:      60,
+		BurstMinBuckets:    3,
+		BurstMinRequests:   10,
 		UseHostFallback:    true,
 		WeightEndpoint:     30,
 		WeightVelocity:     30,
@@ -101,7 +107,8 @@ type LiveStats struct {
 	ResourceKind      string
 	WindowRequests    int64
 	TotalRequests     int64
-	ActiveMinutes     int
+	ActiveBuckets     int
+	BucketSeconds     int
 	RequestsPerMinute float64
 	UniqueResources   int
 	MinuteCounts      []int64
@@ -241,8 +248,8 @@ func scoreResourceDiversity(stats LiveStats, cfg Config) ScoreComponent {
 
 	component.Score = clampInt(int(math.Round(float64(maxWeight)*signalStrength*risk)), 0, maxWeight)
 	component.Weight = maxWeight
-	component.Detail = fmt.Sprintf("%d unique %s values across %d requests in %d active minute(s)",
-		stats.UniqueResources, stats.ResourceKind, stats.WindowRequests, stats.ActiveMinutes)
+	component.Detail = fmt.Sprintf("%d unique %s values across %d requests in %d active %ds bucket(s)",
+		stats.UniqueResources, stats.ResourceKind, stats.WindowRequests, stats.ActiveBuckets, stats.BucketSeconds)
 	return component
 }
 
@@ -254,7 +261,7 @@ func scoreVelocity(stats LiveStats, cfg Config) ScoreComponent {
 	}
 
 	rpm := stats.RequestsPerMinute
-	component.Detail = fmt.Sprintf("%.1f requests/min across %d active minute(s)", rpm, stats.ActiveMinutes)
+	component.Detail = fmt.Sprintf("%.1f requests/min across %d active %ds bucket(s)", rpm, stats.ActiveBuckets, stats.BucketSeconds)
 
 	if rpm <= 10 {
 		return component
@@ -282,7 +289,15 @@ func scoreBurstiness(stats LiveStats, cfg Config) ScoreComponent {
 		Detail: "not enough minute buckets to measure bursts",
 	}
 
-	if len(stats.MinuteCounts) < 3 || stats.WindowRequests < 10 {
+	minBuckets := cfg.BurstMinBuckets
+	if minBuckets <= 0 {
+		minBuckets = 3
+	}
+	minRequests := cfg.BurstMinRequests
+	if minRequests <= 0 {
+		minRequests = 10
+	}
+	if len(stats.MinuteCounts) < minBuckets || stats.WindowRequests < minRequests {
 		return component
 	}
 

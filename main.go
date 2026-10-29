@@ -175,6 +175,27 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 
 	riskCfg := risk.DefaultConfig()
 	riskCfg.UseHostFallback = cfg.UseHostFallback
+	if cfg.DemoMode {
+		riskCfg.MinuteWindow = 2 * time.Minute
+		riskCfg.ResourceWindow = 10 * time.Minute
+		riskCfg.HourWindow = time.Hour
+		riskCfg.BucketSeconds = 5
+		riskCfg.BurstMinBuckets = 2
+		riskCfg.BurstMinRequests = 5
+		riskCfg.DelayThreshold = 30
+		riskCfg.RateLimitThreshold = 45
+		riskCfg.ChallengeThreshold = 60
+		riskCfg.BlockThreshold = 75
+	}
+	if cfg.BucketSeconds > 0 {
+		riskCfg.BucketSeconds = cfg.BucketSeconds
+	}
+	if cfg.BurstMinBuckets > 0 {
+		riskCfg.BurstMinBuckets = cfg.BurstMinBuckets
+	}
+	if cfg.BurstMinRequests > 0 {
+		riskCfg.BurstMinRequests = cfg.BurstMinRequests
+	}
 	if cfg.DelayThreshold >= 0 {
 		riskCfg.DelayThreshold = cfg.DelayThreshold
 	}

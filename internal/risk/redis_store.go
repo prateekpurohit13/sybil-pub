@@ -33,7 +33,12 @@ func (s *RedisStore) Record(ctx context.Context, obs Observation, cfg Config) (L
 	minuteKey := s.key(pairKey, "minutes")
 	hourKey := s.key(pairKey, "hours")
 
-	minuteBucket := strconv.FormatInt(now.Truncate(time.Minute).Unix(), 10)
+	bucketSeconds := cfg.BucketSeconds
+	if bucketSeconds <= 0 {
+		bucketSeconds = 60
+	}
+	bucketDuration := time.Duration(bucketSeconds) * time.Second
+	minuteBucket := strconv.FormatInt(now.Truncate(bucketDuration).Unix(), 10)
 	hourBucket := strconv.FormatInt(now.Truncate(time.Hour).Unix(), 10)
 	retention := cfg.HourWindow + 24*time.Hour
 
@@ -62,7 +67,7 @@ func (s *RedisStore) Record(ctx context.Context, obs Observation, cfg Config) (L
 	lastSeen := unixFromMap(statsCmd.Val(), "last_seen_unix")
 
 	cutoffResources := now.Add(-cfg.ResourceWindow).Unix()
-	cutoffMinutes := now.Add(-cfg.MinuteWindow).Truncate(time.Minute).Unix()
+	cutoffMinutes := now.Add(-cfg.MinuteWindow).Truncate(bucketDuration).Unix()
 	cutoffHours := now.Add(-cfg.HourWindow).Truncate(time.Hour).Unix()
 
 	uniqueResources, staleResources := countFreshResources(resourceCmd.Val(), cutoffResources)
@@ -96,10 +101,11 @@ func (s *RedisStore) Record(ctx context.Context, obs Observation, cfg Config) (L
 		peakToMedian = float64(peakMinute) / medianMinute
 	}
 
-	activeMinutes := len(minuteCounts)
+	activeBuckets := len(minuteCounts)
+	activeMinutes := float64(activeBuckets) * float64(bucketSeconds) / 60.0
 	rpm := 0.0
 	if activeMinutes > 0 {
-		rpm = float64(windowRequests) / float64(activeMinutes)
+		rpm = float64(windowRequests) / activeMinutes
 	}
 
 	return LiveStats{
@@ -107,7 +113,8 @@ func (s *RedisStore) Record(ctx context.Context, obs Observation, cfg Config) (L
 		ResourceKind:      resourceKind,
 		WindowRequests:    windowRequests,
 		TotalRequests:     totalCmd.Val(),
-		ActiveMinutes:     activeMinutes,
+		ActiveBuckets:     activeBuckets,
+		BucketSeconds:     bucketSeconds,
 		RequestsPerMinute: rpm,
 		UniqueResources:   uniqueResources,
 		MinuteCounts:      minuteCounts,

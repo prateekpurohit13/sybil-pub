@@ -25,6 +25,11 @@ FE_PID=""
 
 mkdir -p "${DEMO_DIR}"
 
+if [ ! -d "${ROOT}/sybil_fe" ]; then
+  echo "error: frontend submodule is missing; run: git submodule update --init sybil_fe" >&2
+  exit 2
+fi
+
 redis_ping() {
   redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" ping 2>/dev/null | grep -q PONG
 }

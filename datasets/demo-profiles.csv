@@ -1,0 +1,5 @@
+Application,Library,Device,OS,ja4,ja4s,ja4h,ja4x,ja4t,ja4tscan,Notes
+Chrome 136 (curl_cffi),Chromium,,,t13d1516h2_8daaf6152771_d8a2da3f94cd,,,,,,demo client profile
+Firefox 133 (curl_cffi),NSS,,,t13d1716h2_5b57614c22b0_eeeea6562960,,,,,,demo client profile
+Safari 260 (curl_cffi),Apple,,,t13d2014h2_a09f3c656075_d0a99439f9b1,,,,,,demo client profile
+Edge 101 (curl_cffi),Chromium,,,t13d1516h2_8daaf6152771_e5627efa2ab1,,,,,,demo client profile

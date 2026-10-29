@@ -78,7 +78,9 @@ Use `-lenient` for community exports:
 Sybil uses the libSQL driver, which supports local SQLite files and remote
 Turso databases. The table is `fingerprints`, matching the existing live
 enrichment query. `make demo` uses `datasets/ja4.db` and creates/refreshes it
-from the committed CSV on first run.
+from the committed CSV on first run. It also imports
+`datasets/demo-profiles.csv`, which maps the curl_cffi Chrome/Firefox/Safari/
+Edge profile fingerprints to readable demo labels.
 
 Import the committed CSV into a local database:
 

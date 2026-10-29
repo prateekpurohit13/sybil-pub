@@ -220,8 +220,9 @@ sudo pacman -S redis
 ```
 
 `make demo` uses a local libSQL database at `datasets/ja4.db`. On first run it
-imports `datasets/ja4plus-mapping.csv` into that database; later runs use the
-same database. Refresh it explicitly with:
+imports `datasets/ja4plus-mapping.csv` plus `datasets/demo-profiles.csv` (named
+curl_cffi browser profiles) into that database; later runs use the same
+database. Refresh it explicitly with:
 
 ```bash
 make ja4-db DB=file:datasets/ja4.db

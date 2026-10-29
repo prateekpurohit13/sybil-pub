@@ -109,6 +109,11 @@ if [[ "${DEMO_DB_URL}" == file:* ]]; then
     "${ROOT}/bin/ja4import" \
       -dataset "${ROOT}/datasets/ja4plus-mapping.csv" \
       -db "${DEMO_DB_URL}" -replace
+    if [ -f "${ROOT}/datasets/demo-profiles.csv" ]; then
+      "${ROOT}/bin/ja4import" \
+        -dataset "${ROOT}/datasets/demo-profiles.csv" \
+        -db "${DEMO_DB_URL}"
+    fi
   fi
 fi
 

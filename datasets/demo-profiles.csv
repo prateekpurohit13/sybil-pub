@@ -3,3 +3,7 @@ Chrome 136 (curl_cffi),Chromium,,,t13d1516h2_8daaf6152771_d8a2da3f94cd,,,,,,demo
 Firefox 133 (curl_cffi),NSS,,,t13d1716h2_5b57614c22b0_eeeea6562960,,,,,,demo client profile
 Safari 260 (curl_cffi),Apple,,,t13d2014h2_a09f3c656075_d0a99439f9b1,,,,,,demo client profile
 Edge 101 (curl_cffi),Chromium,,,t13d1516h2_8daaf6152771_e5627efa2ab1,,,,,,demo client profile
+Python 3.14 (OpenSSL),OpenSSL,,,t13d171200_ab0a1bf427ad_ecd0401ec68b,,,,,,demo TLS library
+Go 1.27 (crypto/tls),Go,,,t13d1312h2_f57a46bbacb6_f50d94e863eb,,,,,,demo TLS library
+curl 8.x (OpenSSL),OpenSSL,,,t13d3013h2_1d37bd780c83_8537cf56674e,,,,,,demo TLS library
+OpenSSL 3.6 s_client,OpenSSL,,,t13d0312h1_55b375c5d22e_199193a2bd39,,,,,,demo TLS library

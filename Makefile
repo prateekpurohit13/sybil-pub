@@ -24,7 +24,11 @@ run: build
 run-pcap: build
 	sudo ./bin/sybil -backend pcap -iface $(IFACE)
 
-demo-deps:
+.demo/bin/go-client: cmd/demo-client/main.go
+	mkdir -p .demo/bin
+	go build -o .demo/bin/go-client ./cmd/demo-client
+
+demo-deps: .demo/bin/go-client
 	python3 -m venv .demo/venv
 	.demo/venv/bin/pip install -q -r scripts/requirements-demo.txt
 

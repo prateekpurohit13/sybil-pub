@@ -2,8 +2,8 @@
 """Drive real HTTPS traffic for Sybil demos.
 
 The script sends TLS handshakes to real public HTTPS endpoints, not to a local
-server. It can use curl_cffi impersonation profiles to produce several browser
-fingerprints, or plain Python TLS as a dependency-free fallback.
+server. It can use curl_cffi browser profiles plus Python, Go, curl, and
+OpenSSL TLS stacks to produce several client fingerprints.
 
 Profiles are deliberately rate-capped. Use only with permission for any target
 you supply explicitly. The built-in targets are low-rate public examples.
@@ -13,13 +13,17 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import random
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 PUBLIC_TARGETS = [
@@ -34,6 +38,10 @@ PUBLIC_TARGETS = [
 ]
 
 BROWSER_PROFILES = ["chrome131", "chrome136", "firefox133", "safari260", "edge101"]
+LIB_CLIENTS = ["python", "go", "curl", "openssl"]
+ALL_CLIENTS = BROWSER_PROFILES + LIB_CLIENTS
+ROOT = Path(__file__).resolve().parents[1]
+GO_CLIENT = ROOT / ".demo" / "bin" / "go-client"
 
 
 @dataclass
@@ -54,7 +62,7 @@ PROFILES = {
         duration=12,
         max_requests=48,
         concurrency=4,
-        profiles=BROWSER_PROFILES,
+        profiles=ALL_CLIENTS,
         targets=PUBLIC_TARGETS,
     ),
     "moderate": Config(
@@ -92,7 +100,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=sorted(PROFILES), default="browse")
     parser.add_argument("--engine", choices=["auto", "curl", "ssl"], default="auto")
     parser.add_argument("--targets", help="Comma-separated HTTPS URLs (defaults to the public list)")
-    parser.add_argument("--profiles", help="Comma-separated curl_cffi impersonation profiles")
+    parser.add_argument(
+        "--clients",
+        help="Comma-separated clients: chrome131, chrome136, firefox133, safari260, edge101, python, go, curl, openssl",
+    )
+    parser.add_argument("--profiles", help=argparse.SUPPRESS)
     parser.add_argument("--rate", type=int, help="Total attempts per second")
     parser.add_argument("--duration", type=int, help="Run duration in seconds")
     parser.add_argument("--max-requests", type=int, help="Hard attempt cap")
@@ -110,7 +122,7 @@ def resolve_config(args: argparse.Namespace) -> Config:
         duration=args.duration if args.duration is not None else base.duration,
         max_requests=args.max_requests if args.max_requests is not None else base.max_requests,
         concurrency=args.concurrency if args.concurrency is not None else base.concurrency,
-        profiles=split_list(args.profiles) or base.profiles,
+        profiles=split_list(args.clients) or split_list(args.profiles) or base.profiles,
         targets=split_list(args.targets) or base.targets,
     )
 
@@ -166,6 +178,96 @@ def curl_request(curl_requests, target: str, profile: str, timeout: float) -> bo
         return False
 
 
+def parse_target(target: str) -> tuple[str, int]:
+    parsed = urlparse(target)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return host, port
+
+
+def python_request(context: ssl.SSLContext, target: str, timeout: float) -> bool:
+    return ssl_handshake(context, target, timeout)
+
+
+def curl_cli_request(target: str, timeout: float) -> bool:
+    if shutil.which("curl") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["curl", "-k", "-sS", "-o", os.devnull, "--max-time", str(timeout), target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 2,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def openssl_request(target: str, timeout: float) -> bool:
+    if shutil.which("openssl") is None:
+        return False
+    host, port = parse_target(target)
+    if not host:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "s_client",
+                "-connect", f"{host}:{port}",
+                "-servername", host,
+                "-alpn", "http/1.1",
+                "-tls1_3",
+                "-quiet",
+                "-no_ign_eof",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def go_request(target: str, timeout: float) -> bool:
+    if not GO_CLIENT.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [str(GO_CLIENT), target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def send_request(
+    client: str,
+    context: ssl.SSLContext,
+    curl_requests,
+    target: str,
+    timeout: float,
+) -> bool:
+    if client in BROWSER_PROFILES:
+        if curl_requests is not None:
+            return curl_request(curl_requests, target, client, timeout)
+        return python_request(context, target, timeout)
+    if client == "python":
+        return python_request(context, target, timeout)
+    if client == "go":
+        return go_request(target, timeout)
+    if client == "curl":
+        return curl_cli_request(target, timeout)
+    if client == "openssl":
+        return openssl_request(target, timeout)
+    return False
+
+
 def run(config: Config, engine: str, timeout: float, quiet: bool) -> tuple[int, int]:
     curl_requests = load_curl() if engine in ("auto", "curl") else None
     if engine == "curl" and curl_requests is None:
@@ -187,7 +289,7 @@ def run(config: Config, engine: str, timeout: float, quiet: bool) -> tuple[int, 
 
     def worker() -> None:
         nonlocal attempts, ok, fail, next_index
-        context = ssl_context() if not use_curl else None
+        context = ssl_context()
         while not stop.is_set() and time.time() < deadline:
             with lock:
                 if attempts >= config.max_requests:
@@ -196,13 +298,10 @@ def run(config: Config, engine: str, timeout: float, quiet: bool) -> tuple[int, 
                 next_index += 1
                 attempts += 1
             target = config.targets[index % len(config.targets)]
-            profile = config.profiles[index % len(config.profiles)]
+            client = config.profiles[index % len(config.profiles)]
 
             started = time.time()
-            if use_curl:
-                success = curl_request(curl_requests, target, profile, timeout)
-            else:
-                success = ssl_handshake(context, target, timeout)
+            success = send_request(client, context, curl_requests if use_curl else None, target, timeout)
 
             with lock:
                 if success:
@@ -247,6 +346,17 @@ def main() -> int:
     engine = args.engine
     if engine == "auto":
         engine = "curl" if load_curl() is not None else "ssl"
+
+    if "go" in config.profiles and not GO_CLIENT.exists():
+        print(f"warning: {GO_CLIENT} is missing; run `make demo-deps` or drop `go`", file=sys.stderr)
+        config.profiles = [client for client in config.profiles if client != "go"]
+    if not config.profiles:
+        config.profiles = ["python"]
+
+    unknown = [client for client in config.profiles if client not in ALL_CLIENTS]
+    if unknown:
+        print(f"error: unknown clients: {', '.join(unknown)}", file=sys.stderr)
+        return 2
 
     print(f"profile={config.name} engine={engine}")
     print(f"targets={','.join(config.targets)}")

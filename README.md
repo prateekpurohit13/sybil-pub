@@ -279,15 +279,30 @@ DEMO_IFACE=lo DEMO_PORT=8443 make demo
 bash scripts/demo-suspicious.sh --targets https://localhost:8443/
 ```
 
-Profiles can also be selected directly:
+The `browse` profile uses these clients:
+
+```text
+chrome131, chrome136, firefox133, safari260, edge101,
+python, go, curl, openssl
+```
+
+Each client's JA4 is mapped in `datasets/demo-profiles.csv`, so the frontend
+shows `Chromium Browser`, `Firefox 133`, `Python 3.14 (OpenSSL)`,
+`Go 1.27 (crypto/tls)`, `curl 8.x (OpenSSL)`, etc. instead of
+`Unknown JA4 Client`.
+
+Select specific clients:
 
 ```bash
+bash scripts/demo-benign.sh --clients chrome131,python,go,openssl
 python3 scripts/demo_traffic.py --profile moderate
 python3 scripts/demo_traffic.py --profile flood
 ```
 
-Use `--engine ssl` if `curl_cffi` is not installed; this still sends real
-handshakes, but all traffic has the same Python TLS fingerprint.
+`make demo-deps` also builds the tiny Go ClientHello helper used by the `go`
+client. Use `--engine ssl` if `curl_cffi` is unavailable; browser profiles then
+fall back to Python TLS, while explicit `python`, `go`, `curl`, and `openssl`
+clients still run their own stacks.
 
 Reset demo state between presentations:
 

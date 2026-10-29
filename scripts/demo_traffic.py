@@ -39,9 +39,11 @@ PUBLIC_TARGETS = [
 
 BROWSER_PROFILES = ["chrome131", "chrome136", "firefox133", "safari260", "edge101"]
 LIB_CLIENTS = ["python", "go", "curl", "openssl"]
-ALL_CLIENTS = BROWSER_PROFILES + LIB_CLIENTS
+C2_CLIENT = "c2"
+ALL_CLIENTS = BROWSER_PROFILES + LIB_CLIENTS + [C2_CLIENT]
 ROOT = Path(__file__).resolve().parents[1]
 GO_CLIENT = ROOT / ".demo" / "bin" / "go-client"
+C2_HELLO = ROOT / "datasets" / "demo-c2-hello.bin"
 
 
 @dataclass
@@ -65,7 +67,7 @@ PROFILES = {
         duration=12,
         max_requests=48,
         concurrency=4,
-        profiles=ALL_CLIENTS,
+        profiles=BROWSER_PROFILES + LIB_CLIENTS,
         targets=PUBLIC_TARGETS,
     ),
     "moderate": Config(
@@ -86,6 +88,18 @@ PROFILES = {
         profiles=["chrome131"],
         targets=["https://example.com/"],
         warmup_seconds=10,
+        warmup_rate=1,
+        warmup_concurrency=1,
+    ),
+    "c2": Config(
+        name="c2",
+        rate=40,
+        duration=5,
+        max_requests=200,
+        concurrency=24,
+        profiles=[C2_CLIENT],
+        targets=["https://example.com/"],
+        warmup_seconds=20,
         warmup_rate=1,
         warmup_concurrency=1,
     ),
@@ -258,6 +272,20 @@ def go_request(target: str, timeout: float) -> bool:
         return False
 
 
+def c2_request(target: str, timeout: float) -> bool:
+    if not C2_HELLO.exists():
+        return False
+    host, port = parse_target(target)
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(C2_HELLO.read_bytes())
+        return True
+    except Exception:
+        return False
+
+
 def send_request(
     client: str,
     context: ssl.SSLContext,
@@ -277,6 +305,8 @@ def send_request(
         return curl_cli_request(target, timeout)
     if client == "openssl":
         return openssl_request(target, timeout)
+    if client == "c2":
+        return c2_request(target, timeout)
     return False
 
 
@@ -362,6 +392,9 @@ def main() -> int:
     if "go" in config.profiles and not GO_CLIENT.exists():
         print(f"warning: {GO_CLIENT} is missing; run `make demo-deps` or drop `go`", file=sys.stderr)
         config.profiles = [client for client in config.profiles if client != "go"]
+    if C2_CLIENT in config.profiles and not C2_HELLO.exists():
+        print(f"warning: {C2_HELLO} is missing; dropping `c2`", file=sys.stderr)
+        config.profiles = [client for client in config.profiles if client != C2_CLIENT]
     if not config.profiles:
         config.profiles = ["python"]
 

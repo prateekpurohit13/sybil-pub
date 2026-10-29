@@ -11,3 +11,5 @@ Mozilla Firefox,NSS,,,t13d1714h1_5b57614c22b0_b6469b2faef8,,,,,,observed host Fi
 Mozilla Firefox,NSS,,,t13d1713h1_5b57614c22b0_6a3d802a7139,,,,,,observed host Firefox
 Chrome 155 (background),Chromium,,,t13d1517h2_8daaf6152771_e6dcd7ae0a9e,,,,,,observed background Chrome
 Chrome 155 (background),Chromium,,,t13d1518h2_8daaf6152771_e7cacf613b58,,,,,,observed background Chrome
+C2 Lab Client (OpenSSL fixture),,,,t13d0312h2_55b375c5d22e_a050d233fad5,,,,,,c2 beacon lab fixture; malware_like
+LinkupBot (background),,,,t13d5212h1_b262b3658495_8e6e362c5eac,,,,,,observed background crawler

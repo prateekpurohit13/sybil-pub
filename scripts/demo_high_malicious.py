@@ -13,7 +13,7 @@ def main() -> int:
     python = os.path.join(root, ".demo", "venv", "bin", "python")
     if not os.access(python, os.X_OK):
         python = sys.executable
-    return subprocess.call([python, os.path.join(root, "scripts", "demo_traffic.py"), "--profile", "burst"])
+    return subprocess.call([python, os.path.join(root, "scripts", "demo_traffic.py"), "--profile", "c2"])
 
 
 if __name__ == "__main__":

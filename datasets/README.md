@@ -80,7 +80,9 @@ Turso databases. The table is `fingerprints`, matching the existing live
 enrichment query. `make demo` uses `datasets/ja4.db` and creates/refreshes it
 from the committed CSV on first run. It also imports
 `datasets/demo-profiles.csv`, which maps the curl_cffi Chrome/Firefox/Safari/
-Edge profiles and the Python/Go/curl/OpenSSL demo clients to readable labels.
+Edge profiles, the Python/Go/curl/OpenSSL demo clients, observed background
+clients, and the synthetic C2 lab fixture to readable labels. The C2 fixture
+row has `Notes: c2 beacon lab fixture; malware_like` and is not live intelligence.
 
 Import the committed CSV into a local database:
 

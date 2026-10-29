@@ -7,4 +7,4 @@ PY=python3
 if [ -x "${ROOT}/.demo/venv/bin/python" ]; then
   PY="${ROOT}/.demo/venv/bin/python"
 fi
-exec "${PY}" "${ROOT}/scripts/demo_traffic.py" --profile burst "$@"
+exec "${PY}" "${ROOT}/scripts/demo_traffic.py" --profile c2 "$@"

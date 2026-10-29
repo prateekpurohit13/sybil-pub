@@ -257,19 +257,27 @@ to several real public HTTPS hosts with several browser impersonation profiles:
 bash scripts/demo-benign.sh
 ```
 
-Generate a capped burst against one real HTTPS target:
+Generate the malicious/C2-shaped profile:
 
 ```bash
 bash scripts/demo-suspicious.sh
 ```
 
-The burst uses a 10-second quiet baseline at 1 handshake/s, then 20 handshakes/s
-for 5 seconds (100 burst attempts). The baseline gives the burstiness signal
-something to compare against.
+This runs a **lab C2 fixture** ClientHello with a 20-second quiet baseline at
+1 handshake/s, then 40 handshakes/s for 5 seconds (200 spike attempts). The
+fixture is labelled `C2 Lab Client (OpenSSL fixture)` with a `malware_like`
+reputation in the demo database, so the score reaches roughly 84 and the action
+is `block`. The label is synthetic and explicitly a lab fixture.
+
+The separate browser-behaviour profile is still available:
+
+```bash
+python3 scripts/demo_traffic.py --profile burst
+```
 
 `make demo` captures all TCP/443 traffic on the interface, so background browser
 or telemetry traffic can also appear. Use a loopback lab target or close other
-browsers for a clean run. Known background Chrome/Firefox variants observed in
+browsers for a clean run. Known background Chrome/Firefox/LinkupBot variants observed in
 this lab are mapped in `datasets/demo-profiles.csv`.
 
 Point it at a lab-owned HTTPS target instead:

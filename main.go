@@ -17,6 +17,7 @@ import (
 	"github.com/sophic00/sybil/internal/api"
 	"github.com/sophic00/sybil/internal/capture"
 	"github.com/sophic00/sybil/internal/config"
+	"github.com/sophic00/sybil/internal/dataset"
 	"github.com/sophic00/sybil/internal/db"
 	"github.com/sophic00/sybil/internal/parser"
 	"github.com/sophic00/sybil/internal/risk"
@@ -192,23 +193,20 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 		store = registry.WrapStatsStore(store)
 	}
 
-	var lookup risk.LookupClient
 	closeFns := []func(){func() { _ = rdb.Close() }}
-	switch {
-	case cfg.JA4DBURL != "":
-		dbLookup, closeDB, err := risk.NewLibSQLLookupClient(db.SQLiteConfig{
-			Driver:    "libsql",
-			DSN:       cfg.JA4DBURL,
-			AuthToken: cfg.JA4DBAuthToken,
-		})
-		if err != nil {
-			return nil, func() {}, err
+	cleanup := func() {
+		for i := len(closeFns) - 1; i >= 0; i-- {
+			closeFns[i]()
 		}
-		closeFns = append(closeFns, closeDB)
-		lookup = dbLookup
-	case cfg.JA4LookupURL != "":
-		lookup = risk.NewHTTPLookupClient(cfg.JA4LookupURL, &http.Client{Timeout: cfg.JA4LookupTimeout})
 	}
+
+	lookup, closeLookup, err := newLookup(cfg)
+	if err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	closeFns = append(closeFns, closeLookup)
+
 	if lookup != nil {
 		var observer risk.LookupObserver
 		if registry != nil {
@@ -217,11 +215,34 @@ func newThreatScorer(ctx context.Context, cfg config.Risk, registry *telemetry.R
 		lookup = risk.NewCachedLookupClient(lookup, rdb, cfg.KeyPrefix, cfg.JA4CacheTTL, observer)
 	}
 
-	return risk.NewScorer(store, lookup, riskCfg), func() {
-		for i := len(closeFns) - 1; i >= 0; i-- {
-			closeFns[i]()
+	return risk.NewScorer(store, lookup, riskCfg), cleanup, nil
+}
+
+// newLookup selects the configured enrichment source. The CSV path is
+// explicit and takes precedence over the database and HTTP options.
+func newLookup(cfg config.Risk) (risk.LookupClient, func(), error) {
+	switch {
+	case cfg.JA4CSVPath != "":
+		store, err := dataset.Load(cfg.JA4CSVPath)
+		if err != nil {
+			return nil, func() {}, err
 		}
-	}, nil
+		return store, func() {}, nil
+	case cfg.JA4DBURL != "":
+		lookup, closeDB, err := risk.NewLibSQLLookupClient(db.SQLiteConfig{
+			Driver:    "libsql",
+			DSN:       cfg.JA4DBURL,
+			AuthToken: cfg.JA4DBAuthToken,
+		})
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return lookup, closeDB, nil
+	case cfg.JA4LookupURL != "":
+		return risk.NewHTTPLookupClient(cfg.JA4LookupURL, &http.Client{Timeout: cfg.JA4LookupTimeout}), func() {}, nil
+	default:
+		return nil, func() {}, nil
+	}
 }
 
 func printHelloEvent(event stream.Event) {

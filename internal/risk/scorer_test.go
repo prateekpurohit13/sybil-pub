@@ -168,3 +168,27 @@ func TestScorerPropagatesStoreError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestBurstinessRespectsDemoMinimums(t *testing.T) {
+	stats := LiveStats{
+		WindowRequests:    51,
+		ActiveBuckets:     2,
+		BucketSeconds:     5,
+		MinuteCounts:      []int64{1, 50},
+		PeakMinuteCount:   50,
+		MedianMinuteCount: 1,
+	}
+
+	defaults := scoreBurstiness(stats, DefaultConfig())
+	if defaults.Score != 0 {
+		t.Fatalf("default burst minimum should ignore two buckets, got %d", defaults.Score)
+	}
+
+	demo := DefaultConfig()
+	demo.BurstMinBuckets = 2
+	demo.BurstMinRequests = 5
+	fast := scoreBurstiness(stats, demo)
+	if fast.Score == 0 {
+		t.Fatal("demo burst minimum should score a two-bucket spike")
+	}
+}

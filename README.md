@@ -199,7 +199,21 @@ Open `http://localhost:3001`. The API endpoints require Sybil to be started with
 
 ### Demo Flow
 
-Start Sybil with Redis, the bundled dataset and the fast demo scorer:
+One command starts Redis, the frontend and the pcap backend:
+
+```bash
+make demo
+```
+
+The backend runs in the foreground so its ClientHello output stays visible.
+Redis must be installed natively (`redis-server` and `redis-cli`); Docker is not
+required. On Arch:
+
+```bash
+sudo pacman -S redis
+```
+
+To run the backend manually instead:
 
 ```bash
 sudo ./bin/sybil -backend pcap -iface lo -port 9443 \
@@ -212,7 +226,7 @@ sudo ./bin/sybil -backend pcap -iface lo -port 9443 \
 (`30/45/60/75`) so the dashboard reacts within seconds. Production defaults are
 unchanged; do not use demo thresholds for real triage.
 
-Generate a benign profile (many SNIs, low rate):
+In a second terminal, generate a benign profile (many SNIs, low rate):
 
 ```bash
 bash scripts/demo-benign.sh

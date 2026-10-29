@@ -41,12 +41,5 @@ COPY --from=builder /src/datasets ./datasets
 # docker-compose equivalent:
 #   cap_add: [NET_RAW, NET_ADMIN]
 #   network_mode: host
-USER app:app) and libpcap live
-# capture needs privileges, so start it with capabilities instead of root:
-#   docker run --cap-add=NET_RAW --cap-add=NET_ADMIN --network=host sybil ...
-# docker-compose equivalent:
-#   cap_add: [NET_RAW, NET_ADMIN]
-#   network_mode: host
->>>>>>> origin/main
 USER app:app
 ENTRYPOINT ["./sybil"]

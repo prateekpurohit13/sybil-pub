@@ -18,6 +18,8 @@ import (
 	"github.com/sophic00/sybil/internal/capture"
 	"github.com/sophic00/sybil/internal/dataset"
 	sybildb "github.com/sophic00/sybil/internal/db"
+	"github.com/sophic00/sybil/internal/fingerprint"
+	"github.com/sophic00/sybil/internal/parser"
 	"github.com/sophic00/sybil/internal/stream"
 	"github.com/sophic00/sybil/internal/tlshello"
 )
@@ -38,6 +40,7 @@ type options struct {
 	dbAuthToken string
 	pcapPath    string
 	dumpHello   string
+	helloFile   string
 	ja4Inputs   []string
 	ja4File     string
 	jsonOutput  bool
@@ -125,6 +128,7 @@ func parseFlags() options {
 	flags.StringVar(&opts.dbAuthToken, "db-auth-token", "", "Auth token for a remote libSQL database")
 	flags.StringVar(&opts.pcapPath, "pcap", "", "Optional pcap/pcapng file to analyze")
 	flags.StringVar(&opts.dumpHello, "dump-hello", "", "Write the first ClientHello record bytes from -pcap to this file")
+	flags.StringVar(&opts.helloFile, "hello-file", "", "Parse a raw ClientHello record file and print its JA4")
 	flags.BoolVar(&opts.lenient, "lenient", false, "Skip invalid JA4 rows in the CSV instead of failing")
 	flags.IntVar(&opts.maxMatches, "max-matches", 20, "Maximum matches reported per fingerprint; 0 disables the cap")
 	flags.Var(&inputs, "ja4", "JA4 fingerprint to compare (repeatable)")
@@ -156,6 +160,14 @@ func run(ctx context.Context, opts options) (report, error) {
 
 	result := report{Dataset: store.Stats(), Strict: opts.strict}
 
+	if opts.helloFile != "" {
+		item, err := classifyHelloFile(store, opts.helloFile, opts.maxMatches)
+		if err != nil {
+			return report{}, err
+		}
+		result.Observations = append(result.Observations, item)
+	}
+
 	inputs, err := collectInputs(opts.ja4Inputs, opts.ja4File)
 	if err != nil {
 		return report{}, err
@@ -182,6 +194,30 @@ func run(ctx context.Context, opts options) (report, error) {
 	result.Summary = summarize(result.Observations)
 	result.StrictFailure = result.Summary.Prefix+result.Summary.Unknown+result.Summary.Errors > 0
 	return result, nil
+}
+
+func classifyHelloFile(store *dataset.Store, path string, maxMatches int) (observation, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return observation{}, fmt.Errorf("read hello file: %w", err)
+	}
+	fields, err := parser.ParseClientHello(raw)
+	if err != nil {
+		return observation{}, fmt.Errorf("parse hello file: %w", err)
+	}
+	ja4, err := fingerprint.BuildJA4(fields)
+	if err != nil {
+		return observation{}, fmt.Errorf("build ja4: %w", err)
+	}
+	status, matches, total := classify(store, ja4.Fingerprint)
+	return observation{
+		Origin:     "hello",
+		JA4:        ja4.Fingerprint,
+		SNI:        fields.SNIHost,
+		Status:     status,
+		MatchCount: total,
+		Matches:    limitMatches(matches, maxMatches),
+	}, nil
 }
 
 func collectInputs(values []string, filePath string) ([]string, error) {

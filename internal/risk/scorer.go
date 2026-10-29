@@ -71,6 +71,23 @@ func DefaultConfig() Config {
 	}
 }
 
+// DemoConfig returns the fast demo preset: short buckets, a short window and
+// lower action thresholds. It must not be used for production triage.
+func DemoConfig() Config {
+	cfg := DefaultConfig()
+	cfg.MinuteWindow = 2 * time.Minute
+	cfg.ResourceWindow = 10 * time.Minute
+	cfg.HourWindow = time.Hour
+	cfg.BucketSeconds = 5
+	cfg.BurstMinBuckets = 2
+	cfg.BurstMinRequests = 5
+	cfg.DelayThreshold = 30
+	cfg.RateLimitThreshold = 45
+	cfg.ChallengeThreshold = 55
+	cfg.BlockThreshold = 70
+	return cfg
+}
+
 type Observation struct {
 	JA4       string
 	SourceIP  string

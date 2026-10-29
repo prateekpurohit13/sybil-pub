@@ -192,3 +192,36 @@ func TestBurstinessRespectsDemoMinimums(t *testing.T) {
 		t.Fatal("demo burst minimum should score a two-bucket spike")
 	}
 }
+
+func TestDemoBurstReachesChallengeThreshold(t *testing.T) {
+	cfg := DemoConfig()
+	scorer := NewScorer(
+		stubStore{stats: LiveStats{
+			PairKey:           "ja4|1.2.3.4",
+			ResourceKind:      "host",
+			WindowRequests:    110,
+			TotalRequests:     110,
+			ActiveBuckets:     3,
+			BucketSeconds:     5,
+			RequestsPerMinute: 440,
+			UniqueResources:   1,
+			MinuteCounts:      []int64{5, 5, 100},
+			PeakMinuteCount:   100,
+			MedianMinuteCount: 5,
+			PeakToMedianRatio: 20,
+		}},
+		nil,
+		cfg,
+	)
+
+	assessment, err := scorer.Assess(context.Background(), Observation{
+		JA4:      "ja4",
+		SourceIP: "1.2.3.4",
+	})
+	if err != nil {
+		t.Fatalf("Assess returned error: %v", err)
+	}
+	if assessment.Score < cfg.ChallengeThreshold {
+		t.Fatalf("demo burst score = %d, want >= %d: %+v", assessment.Score, cfg.ChallengeThreshold, assessment.Components)
+	}
+}

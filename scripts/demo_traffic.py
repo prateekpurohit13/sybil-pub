@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -53,6 +53,9 @@ class Config:
     concurrency: int
     profiles: list[str]
     targets: list[str]
+    warmup_seconds: int = 0
+    warmup_rate: int = 1
+    warmup_concurrency: int = 1
 
 
 PROFILES = {
@@ -77,20 +80,26 @@ PROFILES = {
     "burst": Config(
         name="burst",
         rate=20,
-        duration=10,
-        max_requests=200,
+        duration=5,
+        max_requests=100,
         concurrency=16,
         profiles=["chrome131"],
         targets=["https://example.com/"],
+        warmup_seconds=10,
+        warmup_rate=1,
+        warmup_concurrency=1,
     ),
     "flood": Config(
         name="flood",
         rate=40,
-        duration=8,
-        max_requests=300,
+        duration=5,
+        max_requests=200,
         concurrency=24,
         profiles=["chrome131"],
         targets=["https://example.com/"],
+        warmup_seconds=10,
+        warmup_rate=1,
+        warmup_concurrency=1,
     ),
 }
 
@@ -124,6 +133,9 @@ def resolve_config(args: argparse.Namespace) -> Config:
         concurrency=args.concurrency if args.concurrency is not None else base.concurrency,
         profiles=split_list(args.clients) or split_list(args.profiles) or base.profiles,
         targets=split_list(args.targets) or base.targets,
+        warmup_seconds=base.warmup_seconds,
+        warmup_rate=base.warmup_rate,
+        warmup_concurrency=base.warmup_concurrency,
     )
 
 
@@ -365,12 +377,33 @@ def main() -> int:
         f"rate={config.rate}/s duration={config.duration}s "
         f"max_requests={config.max_requests} concurrency={config.concurrency}"
     )
+    if config.warmup_seconds > 0:
+        print(
+            f"warmup={config.warmup_seconds}s rate={config.warmup_rate}/s "
+            f"concurrency={config.warmup_concurrency}"
+        )
     if engine == "ssl":
         print("warning: Python TLS produces one fingerprint; install curl_cffi for browser profiles")
 
+    warmup_ok = 0
+    warmup_fail = 0
+    if config.warmup_seconds > 0:
+        warmup = replace(
+            config,
+            name=f"{config.name}-warmup",
+            rate=config.warmup_rate,
+            duration=config.warmup_seconds,
+            max_requests=config.warmup_rate * config.warmup_seconds,
+            concurrency=config.warmup_concurrency,
+        )
+        warmup_ok, warmup_fail = run(warmup, engine, args.timeout, args.quiet)
+
     ok, fail = run(config, engine, args.timeout, args.quiet)
-    print(f"done: ok={ok} fail={fail} attempts={ok + fail}")
-    return 0 if ok > 0 else 1
+    print(
+        f"done: ok={ok + warmup_ok} fail={fail + warmup_fail} "
+        f"attempts={ok + fail + warmup_ok + warmup_fail}"
+    )
+    return 0 if ok + warmup_ok > 0 else 1
 
 
 if __name__ == "__main__":

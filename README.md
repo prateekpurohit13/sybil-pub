@@ -247,7 +247,7 @@ sudo ./bin/sybil -backend pcap -iface wlan0 -port 443 \
 ```
 
 `-risk-demo` uses 5-second buckets, a 2-minute window and demo thresholds
-(`30/45/60/75`) so the dashboard reacts within seconds. Production defaults are
+(`30/45/55/70`) so the dashboard reacts within seconds. Production defaults are
 unchanged; do not use demo thresholds for real triage.
 
 In a second terminal, generate a benign profile. It sends low-rate handshakes
@@ -263,8 +263,9 @@ Generate a capped burst against one real HTTPS target:
 bash scripts/demo-suspicious.sh
 ```
 
-The burst defaults to `https://example.com/` at 20 handshakes/s for 10 seconds
-(200 attempts maximum). Point it at a lab-owned HTTPS target instead:
+The burst uses a 10-second quiet baseline at 1 handshake/s, then 20 handshakes/s
+for 5 seconds (100 burst attempts). The baseline gives the burstiness signal
+something to compare against. Point it at a lab-owned HTTPS target instead:
 
 ```bash
 bash scripts/demo-suspicious.sh --targets https://localhost:8443/

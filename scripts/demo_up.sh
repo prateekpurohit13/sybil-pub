@@ -83,6 +83,33 @@ fi
 
 bash "${ROOT}/scripts/demo_reset.sh" "${PREFIX}" >/dev/null 2>&1 || true
 
+DEMO_DB_URL="${DEMO_DB_URL:-}"
+DEMO_DB_TOKEN="${DEMO_DB_TOKEN:-}"
+DEFAULT_DB_URL="file:${ROOT}/datasets/ja4.db"
+if [ -z "${DEMO_DB_URL}" ]; then
+  DEMO_DB_URL="${DEFAULT_DB_URL}"
+fi
+
+if [[ "${DEMO_DB_URL}" == file:* ]]; then
+  db_path="${DEMO_DB_URL#file:}"
+  if [[ "${db_path}" != /* ]]; then
+    db_path="${ROOT}/${db_path}"
+    DEMO_DB_URL="file:${db_path}"
+  fi
+  if [ "${DEMO_DB_URL}" = "${DEFAULT_DB_URL}" ] || [ ! -s "${db_path}" ]; then
+    (cd "${ROOT}" && go build -o bin/ja4import ./cmd/ja4import)
+    "${ROOT}/bin/ja4import" \
+      -dataset "${ROOT}/datasets/ja4plus-mapping.csv" \
+      -db "${DEMO_DB_URL}" -replace
+  fi
+fi
+
+LOOKUP_ARGS=(-ja4-db-url "${DEMO_DB_URL}")
+DATASET_LABEL="libSQL ${DEMO_DB_URL}"
+if [ -n "${DEMO_DB_TOKEN}" ]; then
+  LOOKUP_ARGS+=(-ja4-db-auth-token "${DEMO_DB_TOKEN}")
+fi
+
 (cd "${ROOT}" && go build -o bin/sybil .)
 
 if ! command -v node >/dev/null 2>&1; then
@@ -144,6 +171,7 @@ Sybil demo is ready.
   API:      http://127.0.0.1:${API_ADDR##*:}
   Frontend: http://127.0.0.1:${FE_PORT}
   Redis:    ${REDIS_HOST}:${REDIS_PORT}
+  Dataset:  ${DATASET_LABEL}
   Capture:  ${IFACE}:${PORT} (pcap output below)
 
 In another terminal:
@@ -160,7 +188,7 @@ EOF
   -iface "${IFACE}" \
   -port "${PORT}" \
   -redis-addr "${REDIS_ADDR}" \
-  -ja4-csv "${ROOT}/datasets/ja4plus-mapping.csv" \
+  "${LOOKUP_ARGS[@]}" \
   -risk-demo \
   -risk-key-prefix "${PREFIX}" \
   -http-addr "${API_ADDR}"

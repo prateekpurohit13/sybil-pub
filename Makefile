@@ -3,6 +3,8 @@
 IFACE ?= wlan0
 DEMO_IFACE ?= lo
 REDIS_ADDR ?= 127.0.0.1:6379
+DEMO_DB_URL ?=
+DEMO_DB_TOKEN ?=
 PCAP ?=
 DB ?=
 
@@ -22,7 +24,9 @@ run-pcap: build
 	sudo ./bin/sybil -backend pcap -iface $(IFACE)
 
 demo:
-	IFACE="$(DEMO_IFACE)" REDIS_ADDR="$(REDIS_ADDR)" ./scripts/demo_up.sh
+	IFACE="$(DEMO_IFACE)" REDIS_ADDR="$(REDIS_ADDR)" \
+	DEMO_DB_URL="$(DEMO_DB_URL)" DEMO_DB_TOKEN="$(DEMO_DB_TOKEN)" \
+	./scripts/demo_up.sh
 
 test:
 	go test ./...

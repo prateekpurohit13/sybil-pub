@@ -213,12 +213,28 @@ required. On Arch:
 sudo pacman -S redis
 ```
 
+`make demo` uses a local libSQL database at `datasets/ja4.db`. On first run it
+imports `datasets/ja4plus-mapping.csv` into that database; later runs use the
+same database. Refresh it explicitly with:
+
+```bash
+make ja4-db DB=file:datasets/ja4.db
+```
+
+Use a remote libSQL/Turso dataset instead:
+
+```bash
+DEMO_DB_URL=libsql://your-db.turso.io \
+DEMO_DB_TOKEN="$AUTH_TOKEN" \
+make demo
+```
+
 To run the backend manually instead:
 
 ```bash
 sudo ./bin/sybil -backend pcap -iface lo -port 9443 \
   -redis-addr 127.0.0.1:6379 \
-  -ja4-csv datasets/ja4plus-mapping.csv \
+  -ja4-db-url file:datasets/ja4.db \
   -risk-demo -risk-key-prefix sybil:demo
 ```
 

@@ -77,7 +77,8 @@ Use `-lenient` for community exports:
 
 Sybil uses the libSQL driver, which supports local SQLite files and remote
 Turso databases. The table is `fingerprints`, matching the existing live
-enrichment query.
+enrichment query. `make demo` uses `datasets/ja4.db` and creates/refreshes it
+from the committed CSV on first run.
 
 Import the committed CSV into a local database:
 

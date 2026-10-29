@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Start a local TLS target server and drive bursty requests to it.
+"""Start a local TLS target and drive a fast, labelled Sybil demo profile.
 
-This script is intended for local/lab testing of Sybil scoring behavior.
-It does two things in one process:
-1. Starts a local HTTPS server (self-signed cert generated at runtime via openssl).
-2. Sends phased request traffic to that server to emulate calm->spike behavior.
+The script is self-contained: it creates a temporary self-signed certificate,
+starts a local HTTPS server, and sends real TLS handshakes at a controlled rate.
+Profiles:
+
+  benign    many SNIs, low rate          -> low diversity pressure
+  moderate  many SNIs, medium rate       -> delay / rate-limit transition
+  burst     one SNI, high rate           -> quick escalation
+  flood     one SNI, very high rate      -> sustained pressure
+
+It is intended for a lab-owned interface only.
 """
 
 from __future__ import annotations
@@ -31,6 +37,46 @@ class Phase:
     concurrency: int
 
 
+PROFILES = {
+    "benign": {
+        "spike_seconds": 20,
+        "spike_rate": 1,
+        "spike_concurrency": 1,
+        "snis": [f"cdn-{letter}.local" for letter in "abcdefgh"],
+    },
+    "moderate": {
+        "spike_seconds": 15,
+        "spike_rate": 3,
+        "spike_concurrency": 8,
+        "snis": [f"cdn-{letter}.local" for letter in "abcdefgh"],
+    },
+    "burst": {
+        "warmup_seconds": 2,
+        "warmup_rate": 2,
+        "warmup_concurrency": 4,
+        "mid_seconds": 2,
+        "mid_rate": 2,
+        "mid_concurrency": 4,
+        "spike_seconds": 20,
+        "spike_rate": 25,
+        "spike_concurrency": 16,
+        "sni": "c2.lab.local",
+    },
+    "flood": {
+        "warmup_seconds": 2,
+        "warmup_rate": 2,
+        "warmup_concurrency": 4,
+        "mid_seconds": 2,
+        "mid_rate": 2,
+        "mid_concurrency": 4,
+        "spike_seconds": 30,
+        "spike_rate": 40,
+        "spike_concurrency": 24,
+        "sni": "c2.lab.local",
+    },
+}
+
+
 class QuietHandler(BaseHTTPRequestHandler):
     server_version = "SybilDemoTLS/1.0"
 
@@ -43,7 +89,6 @@ class QuietHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *_args) -> None:
-        # Keep output clean during high-rate tests.
         return
 
 
@@ -69,10 +114,10 @@ def generate_self_signed_cert(cert_path: str, key_path: str, common_name: str) -
 
 def start_https_server(bind: str, port: int, cert_path: str, key_path: str) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((bind, port), QuietHandler)
+    httpd.daemon_threads = True
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     return httpd
@@ -105,81 +150,128 @@ def request_once(context: ssl.SSLContext, request: bytes, host: str, port: int, 
         return False
 
 
-def run_phase(phase: Phase, host: str, port: int, sni: str, timeout: float, path: str) -> tuple[int, int]:
+def run_phase(phase: Phase, host: str, port: int, snis: list[str], timeout: float, path: str, quiet: bool) -> tuple[int, int]:
     stop_at = time.time() + phase.duration_seconds
     ok = 0
     fail = 0
+    counter = 0
     lock = threading.Lock()
 
     def worker() -> None:
-        nonlocal ok, fail
+        nonlocal ok, fail, counter
         context = make_client_context()
-        request = build_http_request(path, sni)
         pace = 1.0 / max(phase.requests_per_worker_per_second, 1)
         while time.time() < stop_at:
+            with lock:
+                sni = snis[counter % len(snis)]
+                counter += 1
+
             started = time.time()
-            success = request_once(context, request, host, port, sni, timeout)
+            success = request_once(context, build_http_request(path, sni), host, port, sni, timeout)
             with lock:
                 if success:
                     ok += 1
                 else:
                     fail += 1
 
-            jitter = random.uniform(-0.002, 0.002)
-            sleep_for = max(0.0, pace + jitter - (time.time() - started))
+            sleep_for = max(0.0, pace + random.uniform(-0.002, 0.002) - (time.time() - started))
             time.sleep(sleep_for)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=phase.concurrency) as pool:
-        futures = [pool.submit(worker) for _ in range(phase.concurrency)]
-        for future in futures:
-            future.result()
+    stop_monitor = threading.Event()
+
+    def monitor() -> None:
+        last_total = 0
+        while not stop_monitor.wait(1.0):
+            with lock:
+                current_ok, current_fail = ok, fail
+            total = current_ok + current_fail
+            if not quiet:
+                print(
+                    f"  {phase.name}: {total} attempts "
+                    f"({current_ok} ok, {current_fail} fail, +{total - last_total}/s)",
+                    flush=True,
+                )
+            last_total = total
+
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=phase.concurrency) as pool:
+            futures = [pool.submit(worker) for _ in range(phase.concurrency)]
+            for future in futures:
+                future.result()
+    finally:
+        stop_monitor.set()
+        monitor_thread.join(timeout=2)
 
     return ok, fail
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Start local TLS server and send bursty traffic to it")
+    p = argparse.ArgumentParser(description="Start a local TLS target and drive a fast Sybil demo profile")
+    p.add_argument("--profile", choices=sorted(PROFILES), default="burst", help="Traffic profile (default: burst)")
     p.add_argument("--bind", default="127.0.0.1", help="Server bind address (default: 127.0.0.1)")
     p.add_argument("--port", type=int, default=9443, help="Server port (default: 9443)")
-    p.add_argument("--sni", default="localhost", help="TLS SNI and Host header (default: localhost)")
+    p.add_argument("--sni", default=None, help="Single TLS SNI and Host header")
+    p.add_argument("--snis", default=None, help="Comma-separated SNIs for benign diversity")
     p.add_argument("--path", default="/", help="HTTP path to request (default: /)")
     p.add_argument("--timeout", type=float, default=2.0, help="Socket timeout seconds")
+    p.add_argument("--quiet", action="store_true", help="Suppress per-second progress lines")
 
-    p.add_argument("--warmup-seconds", type=int, default=20)
-    p.add_argument("--warmup-rate", type=int, default=2)
-    p.add_argument("--warmup-concurrency", type=int, default=4)
+    p.add_argument("--warmup-seconds", type=int, default=None)
+    p.add_argument("--warmup-rate", type=int, default=None)
+    p.add_argument("--warmup-concurrency", type=int, default=None)
 
-    p.add_argument("--mid-seconds", type=int, default=20)
-    p.add_argument("--mid-rate", type=int, default=2)
-    p.add_argument("--mid-concurrency", type=int, default=4)
+    p.add_argument("--mid-seconds", type=int, default=None)
+    p.add_argument("--mid-rate", type=int, default=None)
+    p.add_argument("--mid-concurrency", type=int, default=None)
 
-    p.add_argument("--spike-seconds", type=int, default=35)
-    p.add_argument("--spike-rate", type=int, default=140)
-    p.add_argument("--spike-concurrency", type=int, default=64)
+    p.add_argument("--spike-seconds", type=int, default=None)
+    p.add_argument("--spike-rate", type=int, default=None)
+    p.add_argument("--spike-concurrency", type=int, default=None)
     return p.parse_args()
+
+
+def value(args: argparse.Namespace, name: str, profile: dict, default: int) -> int:
+    explicit = getattr(args, name)
+    if explicit is not None:
+        return explicit
+    return profile.get(name, default)
 
 
 def main() -> int:
     args = parse_args()
+    profile = PROFILES[args.profile]
 
     if not shutil_which("openssl"):
         print("error: openssl is required but was not found in PATH")
         return 2
 
+    if args.snis:
+        snis = [item.strip() for item in args.snis.split(",") if item.strip()]
+    elif args.sni:
+        snis = [args.sni]
+    else:
+        snis = profile.get("snis", [profile.get("sni", "localhost")])
+
     phases = [
-        Phase("warmup", args.warmup_seconds, args.warmup_rate, args.warmup_concurrency),
-        Phase("mid", args.mid_seconds, args.mid_rate, args.mid_concurrency),
-        Phase("spike", args.spike_seconds, args.spike_rate, args.spike_concurrency),
+        Phase("warmup", value(args, "warmup_seconds", profile, 0), value(args, "warmup_rate", profile, 1), value(args, "warmup_concurrency", profile, 1)),
+        Phase("mid", value(args, "mid_seconds", profile, 0), value(args, "mid_rate", profile, 1), value(args, "mid_concurrency", profile, 1)),
+        Phase("spike", value(args, "spike_seconds", profile, 20), value(args, "spike_rate", profile, 25), value(args, "spike_concurrency", profile, 16)),
     ]
+    phases = [phase for phase in phases if phase.duration_seconds > 0]
 
     with tempfile.TemporaryDirectory(prefix="sybil-demo-") as tmp:
         cert_path = os.path.join(tmp, "cert.pem")
         key_path = os.path.join(tmp, "key.pem")
-        generate_self_signed_cert(cert_path, key_path, args.sni)
+        generate_self_signed_cert(cert_path, key_path, snis[0])
 
         server = start_https_server(args.bind, args.port, cert_path, key_path)
-        print(f"local TLS target started on https://{args.bind}:{args.port}{args.path}")
-        print("traffic pattern: warmup -> mid -> spike")
+        print(f"profile={args.profile} target=https://{args.bind}:{args.port}{args.path}")
+        print(f"snis={','.join(snis)}")
+        if args.profile in ("burst", "flood"):
+            print("interval scoring: run Sybil with -risk-demo and a fresh -risk-key-prefix")
+        print("watch Sybil frontend: Common Fingerprints, Recent Requests, Top Threats")
 
         total_ok = 0
         total_fail = 0
@@ -194,9 +286,10 @@ def main() -> int:
                     phase=phase,
                     host=args.bind,
                     port=args.port,
-                    sni=args.sni,
+                    snis=snis,
                     timeout=args.timeout,
                     path=args.path,
+                    quiet=args.quiet,
                 )
                 total_ok += ok
                 total_fail += fail
@@ -206,7 +299,6 @@ def main() -> int:
             server.server_close()
 
     print(f"done: total_ok={total_ok} total_fail={total_fail}")
-    print("watch Sybil Threat Lens and Sybil Overview during the run")
     return 0
 
 

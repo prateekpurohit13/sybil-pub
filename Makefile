@@ -1,6 +1,8 @@
-.PHONY: build test setup generate run run-pcap verify-ja4 ja4-db clean
+.PHONY: build test setup generate run run-pcap run-demo verify-ja4 ja4-db clean
 
 IFACE ?= wlan0
+DEMO_IFACE ?= lo
+REDIS_ADDR ?= 127.0.0.1:6379
 PCAP ?=
 DB ?=
 
@@ -18,6 +20,12 @@ run: build
 
 run-pcap: build
 	sudo ./bin/sybil -backend pcap -iface $(IFACE)
+
+run-demo: build
+	sudo ./bin/sybil -backend pcap -iface $(DEMO_IFACE) -port 9443 \
+		-redis-addr $(REDIS_ADDR) \
+		-ja4-csv datasets/ja4plus-mapping.csv \
+		-risk-demo -risk-key-prefix sybil:demo
 
 test:
 	go test ./...

@@ -375,7 +375,7 @@
       "type": "timeseries"
     }
   ],
-  "refresh": "5s",
+  "refresh": "2s",
   "schemaVersion": 39,
   "style": "dark",
   "tags": [
@@ -393,6 +393,6 @@
   "timezone": "",
   "title": "Sybil Overview",
   "uid": "sybil-overview",
-  "version": 1,
+  "version": 3,
   "weekStart": ""
 }

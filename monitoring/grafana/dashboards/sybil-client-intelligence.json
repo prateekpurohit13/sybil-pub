@@ -472,7 +472,7 @@
       "type": "table"
     }
   ],
-  "refresh": "5s",
+  "refresh": "2s",
   "schemaVersion": 39,
   "style": "dark",
   "tags": [
@@ -490,6 +490,6 @@
   "timezone": "",
   "title": "Sybil Client Intelligence",
   "uid": "sybil-client-intel",
-  "version": 1,
+  "version": 3,
   "weekStart": ""
 }

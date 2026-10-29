@@ -1,13 +1,15 @@
-.PHONY: build test setup generate run run-pcap clean
+.PHONY: build test setup generate run run-pcap verify-ja4 clean
 
 IFACE ?= wlan0
+PCAP ?=
 
 generate:
 	go generate ./ebpf
 
 build: generate
 	mkdir -p bin
-	go build -o bin/sybil main.go
+	go build -o bin/sybil .
+	go build -o bin/ja4check ./cmd/ja4check
 
 run: build
 	sudo ./bin/sybil -iface $(IFACE)
@@ -17,6 +19,11 @@ run-pcap: build
 
 test:
 	go test ./...
+
+verify-ja4:
+	mkdir -p bin
+	go build -o bin/ja4check ./cmd/ja4check
+	./bin/ja4check -dataset datasets/ja4plus-mapping.csv $(if $(PCAP),-pcap $(PCAP),) -strict
 
 setup:
 	git config core.hooksPath .githooks

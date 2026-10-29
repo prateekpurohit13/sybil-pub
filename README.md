@@ -16,10 +16,11 @@ make build
 
 Note: the project uses CGO-enabled dependencies (`libpcap` and `go-libsql`), so builds must keep `CGO_ENABLED=1`.
 
-Binary path:
+Binary paths:
 
 ```text
-./bin/sybil
+./bin/sybil       live capture, scoring, metrics, API
+./bin/ja4check    offline pcap/dataset comparison
 ```
 
 ### Capture Backends
@@ -59,6 +60,7 @@ sudo ./bin/sybil -backend ebpf -iface wlan0
 -redis-password <pwd>   Redis password
 -redis-db <n>           Redis database number (default: 0)
 -risk-key-prefix <key>  Redis prefix for scoring state
+-ja4-csv <path>         JA4+ mapping CSV for enrichment (takes precedence)
 -ja4-lookup-url <url>   Optional JA4 enrichment URL or template
 -ja4-db-url <url>       Optional libSQL/Turso JA4 database URL
 -ja4-db-auth-token <t>  Optional auth token for the JA4 database
@@ -90,6 +92,44 @@ The binary reads `DB_URL` and `AUTH_TOKEN` from the environment by default, or y
 
 When enrichment is enabled, Sybil classifies traffic into demo-friendly categories such as `verified_browser`, `automation`, `vpn`, `mobile_app`, `known_unverified`, and `unknown`.
 These labels feed the Grafana dashboards and also influence the reputation component of the threat score.
+
+The bundled FoxIO mapping table can be used without a database:
+
+```bash
+sudo ./bin/sybil -backend pcap -iface wlan0 -redis-addr 127.0.0.1:6379 \
+  -ja4-csv datasets/ja4plus-mapping.csv
+```
+
+`-ja4-csv` takes precedence over `-ja4-db-url` and `-ja4-lookup-url`.
+
+### Dataset Comparison
+
+`bin/ja4check` compares computed JA4 fingerprints with `datasets/ja4plus-mapping.csv`.
+It reports `exact`, `ambiguous`, `prefix` (same `JA4_a` only), `unknown`, and
+parse errors. Exact matches are required by `-strict`.
+
+Compare explicit fingerprints:
+
+```bash
+./bin/ja4check -ja4 t13d1516h2_8daaf6152771_02713d6af862
+```
+
+Compare every ClientHello in an offline pcap/pcapng file:
+
+```bash
+./bin/ja4check -pcap capture.pcap -strict
+./bin/ja4check -pcap capture.pcap -port 443 -json
+```
+
+Or through Make:
+
+```bash
+make verify-ja4 PCAP=capture.pcap
+```
+
+The CSV contains fingerprint labels, not packet payloads. Wire-level validation
+therefore requires a pcap; the CSV alone cannot prove that a ClientHello was
+parsed correctly.
 
 ### Metrics And Grafana
 
@@ -176,18 +216,19 @@ When a ClientHello is detected, Sybil prints parsed fields such as protocol, TLS
  Language              Files        Lines         Code     Comments       Blanks
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  C                         1           41           27            5            9
- Dockerfile                1           26           18            5            3
- Go                       27         4956         4214          112          630
- JSON                      3         1223         1223            0            0
- Makefile                  1           26           18            0            8
+ Dockerfile                1           27           19            5            3
+ Go                       33         6579         5628          141          810
+ JSON                      3         1284         1284            0            0
+ Makefile                  1           33           24            0            9
+ Python                    5          671          532           15          124
  Shell                     2           31           25            2            4
  YAML                      4           66           60            0            6
 ─────────────────────────────────────────────────────────────────────────────────
- Markdown                  1          176            0          120           56
- |- BASH                   1           17           17            0            0
- (Total)                              193           17          120           56
+ Markdown                  2          231            0          157           74
+ |- BASH                   2           28           25            2            1
+ (Total)                              259           25          159           75
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Total                    40         6562         5602          244          716
+ Total                    52         8991         7624          327         1040
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 <!-- tokei-end -->

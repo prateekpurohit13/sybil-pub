@@ -14,13 +14,14 @@ COPY go.mod ./
 COPY go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -trimpath -o /out/${BIN_NAME} ./cmd
+RUN go build -trimpath -o /out/${BIN_NAME} .
 
 # Stage 2: The final runtime image (Tiny)
 FROM alpine:${ALPINE_VERSION} AS runtime
 WORKDIR /app
 RUN apk add --no-cache libpcap ca-certificates && update-ca-certificates
 COPY --from=builder /out/${BIN_NAME} ./${BIN_NAME}
+COPY --from=builder /src/datasets ./datasets
 RUN addgroup -S app && adduser -S app -G app
 USER app:app
 ENTRYPOINT ["./sybil"]
